@@ -435,6 +435,14 @@ async def dashboard_page():
     return HTMLResponse(content="<h1>Dashboard</h1>")
 
 
+@app.get("/download", response_class=HTMLResponse)
+async def download_page():
+    template_path = TEMPLATES_DIR / "download.html"
+    if template_path.exists():
+        return HTMLResponse(content=template_path.read_text())
+    return HTMLResponse(content="<h1>Download</h1>")
+
+
 @app.get("/health")
 async def health():
     return {"status": "healthy"}
