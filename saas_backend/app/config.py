@@ -41,8 +41,9 @@ class Settings(BaseSettings):
         url = self.DATABASE_URL
         if url.startswith("postgres://"):
             url = url.replace("postgres://", "postgresql+asyncpg://", 1)
-        elif url.startswith("postgresql://"):
+        elif url.startswith("postgresql://") and not url.startswith("postgresql+asyncpg://"):
             url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
+        # SQLite URLs already have the correct format (sqlite+aiosqlite://)
         return url
 
     class Config:
