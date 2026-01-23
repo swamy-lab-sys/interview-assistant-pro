@@ -411,6 +411,30 @@ async def landing_page():
     return HTMLResponse(content="<h1>Interview Assistant Pro API</h1><p>Version 1.0.0</p>")
 
 
+@app.get("/register", response_class=HTMLResponse)
+async def register_page():
+    template_path = TEMPLATES_DIR / "register.html"
+    if template_path.exists():
+        return HTMLResponse(content=template_path.read_text())
+    return HTMLResponse(content="<h1>Register</h1>")
+
+
+@app.get("/login", response_class=HTMLResponse)
+async def login_page():
+    template_path = TEMPLATES_DIR / "login.html"
+    if template_path.exists():
+        return HTMLResponse(content=template_path.read_text())
+    return HTMLResponse(content="<h1>Login</h1>")
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard_page():
+    template_path = TEMPLATES_DIR / "dashboard.html"
+    if template_path.exists():
+        return HTMLResponse(content=template_path.read_text())
+    return HTMLResponse(content="<h1>Dashboard</h1>")
+
+
 @app.get("/health")
 async def health():
     return {"status": "healthy"}
