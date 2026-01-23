@@ -1,0 +1,63 @@
+E. VENKATA CHALAPATHI
+Senior Python / Django Developer
+📞 9160232405   ✉️ venkatachalapathi1111@gmail.com
+PROFESSIONAL SUMMARY
+    • Over 5+ years of professional experience in Python and Django development
+    • Currently working on a large-scale enterprise HRMS platform at MediaMint Technologies with 70+ Django applications
+    • Expertise in developing scalable web applications, RESTful APIs, and backend systems
+    • Strong experience in MySQL and PostgreSQL database design, optimization, and performance tuning
+    • Integrated third-party services including Salesforce, Zoho Desk, Google APIs, MoveInSync, and payment systems
+    • Hands-on exposure to Next.js and React through real-world projects
+    • Experienced with Git, CI/CD pipelines, and modern development workflows
+    • Self-driven engineer with strong problem-solving skills
+WORK EXPERIENCE
+Python Developer – MediaMint Technologies (Apr 2023 – Present)
+    • Designed, developed, and maintained enterprise HRMS modules including onboarding, attendance, payroll, IT helpdesk, reimbursements, and billing
+    • Developed RESTful APIs using Django REST Framework
+    • Integrated Salesforce, Zoho Desk, MoveInSync, Google APIs, and Zeta Insurance
+    • Implemented role-based access control (RBAC), approval workflows, and audit logging
+    • Optimized MySQL database schemas and queries for performance
+    • Generated Excel and PDF reports using OpenPyXL and PDFKit
+    • Maintained GitLab CI/CD pipelines
+    • Resolved critical PHP-based Google Chrome extension production issues
+    • Built a Next.js employee listing prototype using AI-assisted tools
+Python Developer – Capgemini Technology Services India Ltd (Feb 2020 – Apr 2023)
+    • Developed and maintained Django-based enterprise applications
+    • Built REST APIs and automated reporting solutions
+    • Designed and optimized MySQL databases
+    • Created dashboards and scheduled automated reports
+    • Performed testing, debugging, and production support
+    • Collaborated with cross-functional teams for timely feature delivery
+PERSONAL / INTERNAL PROJECTS
+    • FreelanceFlow – Time Tracker & AI Client Report Generator
+Chrome Extension and SaaS backend with automatic time tracking, AI-generated client reports, CSV/PDF export, and multi-project management. Tech stack includes FastAPI, PostgreSQL, Stripe, and OpenAI/Claude APIs.
+    • Ayyappa Swami Bhajana Songs App
+Devotional web application providing structured song listings for daily bhajanas.
+    • Trading Assistant Dashboard
+Django-based options trading analytics dashboard to assist traders with daily decisions.
+    • PocketHQ – Personal Finance Manager
+Personal finance and task management platform built with Next.js, TypeScript, Prisma, and PostgreSQL.
+TECHNICAL SKILLS
+Category
+Details
+Languages
+Python, JavaScript, TypeScript
+Frameworks
+Django, Flask, FastAPI, Next.js
+Frontend
+HTML, CSS, React, Tailwind CSS
+Databases
+MySQL, PostgreSQL, SQLite
+APIs & Auth
+Django REST Framework, JWT, OAuth
+Tools & CI/CD
+Git, GitLab CI/CD, VS Code, PyCharm, Docker
+Cloud & Integrations
+Google Cloud Storage, Stripe
+Platforms
+Windows, Linux (Ubuntu)
+DECLARATION
+I hereby declare that the above information is true and correct to the best of my knowledge and belief.
+Date: December 2025
+Place:
+E. VENKATA CHALAPATHI

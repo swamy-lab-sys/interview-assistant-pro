@@ -1,0 +1,57 @@
+version: '3.8'
+
+services:
+  interview-assistant:
+    build: .
+    container_name: interview-voice-assistant
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - HUGGINGFACE_TOKEN=${HUGGINGFACE_TOKEN:-}
+      - PULSE_SERVER=unix:/run/user/1000/pulse/native
+    volumes:
+      # Mount PulseAudio socket for audio access
+      - /run/user/1000/pulse:/run/user/1000/pulse
+      - ~/.config/pulse/cookie:/root/.config/pulse/cookie:ro
+      # Persist answers
+      - ~/.interview_assistant:/root/.interview_assistant
+      # Mount resume file
+      - ./resume.txt:/app/resume.txt:ro
+    ports:
+      - "8000:8000"
+    devices:
+      # Pass through audio devices
+      - /dev/snd:/dev/snd
+    group_add:
+      - audio
+    restart: unless-stopped
+    network_mode: host
+
+  # GPU-enabled version (use with: docker-compose --profile gpu up)
+  interview-assistant-gpu:
+    build: .
+    container_name: interview-voice-assistant-gpu
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - HUGGINGFACE_TOKEN=${HUGGINGFACE_TOKEN:-}
+      - PULSE_SERVER=unix:/run/user/1000/pulse/native
+    volumes:
+      - /run/user/1000/pulse:/run/user/1000/pulse
+      - ~/.config/pulse/cookie:/root/.config/pulse/cookie:ro
+      - ~/.interview_assistant:/root/.interview_assistant
+      - ./resume.txt:/app/resume.txt:ro
+    ports:
+      - "8000:8000"
+    devices:
+      - /dev/snd:/dev/snd
+    group_add:
+      - audio
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    network_mode: host
+    profiles:
+      - gpu

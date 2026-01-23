@@ -1,0 +1,10 @@
+anthropic
+sounddevice
+numpy
+pyaudio
+webrtcvad
+pyannote.audio
+torch
+whisperx
+flask
+soundfile
