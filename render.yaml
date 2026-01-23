@@ -1,9 +1,3 @@
-databases:
-  - name: interview-assistant-db
-    plan: free
-    databaseName: interview_assistant
-    user: interview_assistant
-
 services:
   - type: web
     name: interview-assistant-api
@@ -14,15 +8,13 @@ services:
     startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: DATABASE_URL
-        fromDatabase:
-          name: interview-assistant-db
-          property: connectionString
+        value: sqlite+aiosqlite:///./interview_assistant.db
       - key: SECRET_KEY
         generateValue: true
       - key: ANTHROPIC_API_KEY
-        sync: false  # Set manually in Render dashboard
+        sync: false
       - key: STRIPE_SECRET_KEY
-        sync: false  # Set manually
+        sync: false
       - key: STRIPE_WEBHOOK_SECRET
         sync: false
       - key: STRIPE_PRICE_ID_MONTHLY
