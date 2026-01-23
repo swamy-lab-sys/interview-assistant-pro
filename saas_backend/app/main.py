@@ -121,42 +121,68 @@ async def check_usage_limit(user: User):
         )
 
 
+# ============ Debug Route ============
+
+@app.get("/api/debug")
+async def debug_info():
+    """Debug endpoint to test configuration"""
+    import traceback
+    try:
+        # Test password hashing
+        test_hash = get_password_hash("test")
+        hash_works = len(test_hash) > 0
+    except Exception as e:
+        hash_works = f"Error: {str(e)}"
+
+    return {
+        "database_url": settings.DATABASE_URL[:30] + "...",
+        "hash_works": hash_works,
+        "anthropic_key_set": bool(settings.ANTHROPIC_API_KEY),
+    }
+
+
 # ============ Auth Routes ============
 
 @app.post("/api/auth/register", response_model=TokenResponse)
 async def register(user_data: UserCreate, db: AsyncSession = Depends(get_db)):
-    # Check if user exists
-    result = await db.execute(select(User).where(User.email == user_data.email))
-    if result.scalar_one_or_none():
-        raise HTTPException(status_code=400, detail="Email already registered")
+    import traceback
+    try:
+        # Check if user exists
+        result = await db.execute(select(User).where(User.email == user_data.email))
+        if result.scalar_one_or_none():
+            raise HTTPException(status_code=400, detail="Email already registered")
 
-    # Create user
-    user = User(
-        email=user_data.email,
-        hashed_password=get_password_hash(user_data.password),
-        full_name=user_data.full_name,
-        api_key=generate_api_key()
-    )
-    db.add(user)
-    await db.commit()
-    await db.refresh(user)
-
-    # Generate token
-    access_token = create_access_token(data={"sub": user.id})
-
-    return TokenResponse(
-        access_token=access_token,
-        token_type="bearer",
-        user=UserResponse(
-            id=user.id,
-            email=user.email,
-            full_name=user.full_name,
-            subscription_tier=user.subscription_tier,
-            questions_this_month=user.questions_this_month,
-            questions_limit=get_questions_limit(user.subscription_tier),
-            api_key=user.api_key
+        # Create user
+        user = User(
+            email=user_data.email,
+            hashed_password=get_password_hash(user_data.password),
+            full_name=user_data.full_name,
+            api_key=generate_api_key()
         )
-    )
+        db.add(user)
+        await db.commit()
+        await db.refresh(user)
+
+        # Generate token
+        access_token = create_access_token(data={"sub": user.id})
+
+        return TokenResponse(
+            access_token=access_token,
+            token_type="bearer",
+            user=UserResponse(
+                id=user.id,
+                email=user.email,
+                full_name=user.full_name,
+                subscription_tier=user.subscription_tier,
+                questions_this_month=user.questions_this_month,
+                questions_limit=get_questions_limit(user.subscription_tier),
+                api_key=user.api_key
+            )
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Registration error: {str(e)}\n{traceback.format_exc()}")
 
 
 @app.post("/api/auth/login", response_model=TokenResponse)
