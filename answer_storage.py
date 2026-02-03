@@ -1,20 +1,22 @@
 """
 Answer Storage for Interview Voice Assistant
 
-SINGLE-ANSWER MODE WITH PERFORMANCE METRICS
+ACCUMULATING ANSWER MODE WITH PERFORMANCE METRICS
 
 Features:
-- Single Q&A displayed at a time
-- New question REPLACES previous (no stacking)
+- ALL Q&A answers kept and displayed (no overwriting)
+- New answers added to the list (interview history preserved)
 - Performance metrics (latency) stored with each answer
 - Thread-safe operations
 """
 
 import json
+import os
 import threading
+import time
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 # Configuration
 ANSWERS_DIR = Path.home() / ".interview_assistant"
@@ -25,7 +27,13 @@ MASTER_LOG_FILE = ANSWERS_DIR / "interview_master_log.jsonl"  # Permanent storag
 # Thread-safe write lock
 _write_lock = threading.Lock()
 
-# Current answer buffer
+# All answers for this session (accumulates, never overwrites)
+_all_answers: List[Dict[str, Any]] = []
+
+# Duplicate lookup index: lowercase question -> index in _all_answers
+_answer_index: Dict[str, int] = {}
+
+# Current answer buffer (the one being streamed right now)
 _current_answer: Dict[str, Any] = {
     'question': '',
     'answer': '',
@@ -34,21 +42,48 @@ _current_answer: Dict[str, Any] = {
     'metrics': None,  # Performance metrics
 }
 
+# Directory creation cache - avoid repeated mkdir syscalls
+_dir_ensured = False
+
+# Throttled write state for streaming chunks
+_last_write_time: float = 0.0
+_WRITE_THROTTLE_INTERVAL = 0.15  # Write to disk at most every 150ms during streaming
+
 
 def ensure_answers_dir():
-    """Create answers directory if not exists."""
-    ANSWERS_DIR.mkdir(parents=True, exist_ok=True)
+    """Create answers directory if not exists (cached after first call)."""
+    global _dir_ensured
+    if not _dir_ensured:
+        ANSWERS_DIR.mkdir(parents=True, exist_ok=True)
+        _dir_ensured = True
 
 
-def _write_current():
-    """Write current answer to file for web UI - IMMEDIATE FLUSH."""
-    import os
+def _write_current(force: bool = False):
+    """Write all answers (including current in-progress) to file for web UI.
+
+    Args:
+        force: If True, always write immediately (used for complete answers).
+               If False, throttle writes to reduce disk I/O during streaming.
+    """
+    global _last_write_time
+
+    now = time.monotonic()
+    if not force and (now - _last_write_time) < _WRITE_THROTTLE_INTERVAL:
+        return
+
     try:
         ensure_answers_dir()
+        # Build full list: completed answers + current in-progress answer
+        display_list = list(_all_answers)
+        # If current answer is being streamed (not yet in _all_answers), add it
+        if _current_answer.get('question') and not _current_answer.get('is_complete'):
+            display_list.append(_current_answer)
         with open(CURRENT_ANSWER_FILE, 'w', encoding='utf-8') as f:
-            json.dump(_current_answer, f, ensure_ascii=False)  # Removed indent for speed
+            json.dump(display_list, f, ensure_ascii=False)
             f.flush()
-            os.fsync(f.fileno())  # Force write to disk immediately
+            if force:
+                os.fsync(f.fileno())
+        _last_write_time = now
     except Exception:
         pass
 
@@ -65,8 +100,8 @@ def _save_to_history():
         pass
 
 
-def _background_log_permanent(data: Dict[str, Any]):
-    """Background task to save to master log."""
+def _log_permanent(data: Dict[str, Any]):
+    """Save to master log (called inline, no thread spawn)."""
     try:
         ensure_answers_dir()
         # Append to master log - NEVER CLEARED
@@ -74,14 +109,14 @@ def _background_log_permanent(data: Dict[str, Any]):
             json.dump(data, f, ensure_ascii=False)
             f.write('\n')
     except Exception:
-        # Silently fail to avoid affecting main thread
         pass
 
 
 def clear_all():
     """Clear all stored answers (fresh start)."""
-    global _current_answer
+    global _current_answer, _all_answers, _answer_index, _dir_ensured
 
+    _dir_ensured = False
     ensure_answers_dir()
 
     with _write_lock:
@@ -92,17 +127,19 @@ def clear_all():
             'is_complete': False,
             'metrics': None,
         }
+        _all_answers = []
+        _answer_index = {}
 
         try:
             with open(CURRENT_ANSWER_FILE, 'w', encoding='utf-8') as f:
-                json.dump(_current_answer, f, ensure_ascii=False)
-            
+                json.dump([], f, ensure_ascii=False)
+
             # Clear history file (Session only)
             if HISTORY_FILE.exists():
                 HISTORY_FILE.unlink()
-                
+
             # NOTE: We DO NOT clear MASTER_LOG_FILE
-                
+
         except Exception:
             pass
 
@@ -110,25 +147,38 @@ def clear_all():
 def set_processing_question(question_text: str):
     """
     Set current question in 'thinking' mode.
+    New question starts streaming -- added to the list, not replacing.
     """
     global _current_answer
     with _write_lock:
         _current_answer = {
             'question': question_text.strip(),
-            'answer': '', # Start empty for streaming
+            'answer': '',  # Start empty for streaming
             'timestamp': datetime.now().isoformat(),
             'is_complete': False,
             'metrics': None,
         }
-        _write_current()
+        _write_current(force=True)
 
 
 def append_answer_chunk(chunk: str):
-    """Append a chunk of text to the current answer (Streaming)."""
+    """Append a chunk of text to the current answer (Streaming).
+
+    Writes are throttled to reduce disk I/O during rapid streaming.
+    """
     global _current_answer
     with _write_lock:
         _current_answer['answer'] += chunk
-        _write_current()
+        _write_current(force=False)
+
+
+def flush_current_to_disk():
+    """Force-flush the current in-progress answer to disk.
+
+    Call this after streaming ends to ensure the final state is persisted.
+    """
+    with _write_lock:
+        _write_current(force=True)
 
 
 def set_complete_answer(
@@ -140,12 +190,13 @@ def set_complete_answer(
     Set complete answer with optional metrics.
 
     ATOMIC OPERATION:
-    - Sets answer (in case streaming missed something or for final clean version)
+    - Finalizes the current answer
+    - Adds it to the accumulated session list
     - Stores performance metrics
     - Single UI update
-    - Triggers background permanent logging
+    - Logs to permanent storage
     """
-    global _current_answer
+    global _current_answer, _all_answers
 
     ensure_answers_dir()
 
@@ -157,69 +208,69 @@ def set_complete_answer(
             'is_complete': True,
             'metrics': metrics,
         }
-        _write_current()
+        # O(1) duplicate lookup via index dict
+        q_lower = question_text.strip().lower()
+        duplicate_idx = _answer_index.get(q_lower)
+
+        if duplicate_idx is not None and duplicate_idx < len(_all_answers):
+            # Update existing entry instead of adding duplicate
+            _all_answers[duplicate_idx] = _current_answer.copy()
+        else:
+            # New question -- add to the list and index
+            _answer_index[q_lower] = len(_all_answers)
+            _all_answers.append(_current_answer.copy())
+
+        _write_current(force=True)
         _save_to_history()
-        
-        # Fire and forget background logging for performance
-        threading.Thread(
-            target=_background_log_permanent, 
-            args=(_current_answer.copy(),)
-        ).start()
+
+        # Permanent logging inline (cheap append, no thread needed)
+        _log_permanent(_current_answer.copy())
 
 
 
 def get_current_answer() -> Optional[Dict[str, Any]]:
     """
-    Get the current answer.
+    Get the current (latest) answer.
 
     Returns:
         dict with question, answer, timestamp, is_complete, metrics
         or None if no answer
     """
-    if CURRENT_ANSWER_FILE.exists():
-        try:
-            with open(CURRENT_ANSWER_FILE, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                if data.get('question'):
-                    return data
-        except Exception:
-            pass
-
+    if _current_answer.get('question'):
+        return _current_answer.copy()
     return None
 
 
 def get_all_answers() -> list:
     """
-    Get unique recent answers (Question-based de-duplication).
+    Get ALL session answers (newest first).
+    No deduplication, no limit -- every Q&A is preserved for interview reference.
+
+    Reads from memory if available (main process), otherwise reads from
+    the JSON file on disk (web server subprocess).
     """
-    answers_map = {} # Key: Question, Value: Answer data
-    
-    # 1. Load history
-    if HISTORY_FILE.exists():
+    with _write_lock:
+        display_list = list(_all_answers)
+        # Include current in-progress answer at the top
+        if _current_answer.get('question') and not _current_answer.get('is_complete'):
+            display_list.append(_current_answer.copy())
+
+    # If in-memory list is empty, read from disk (web server runs in separate process)
+    if not display_list and CURRENT_ANSWER_FILE.exists():
         try:
-            with open(HISTORY_FILE, 'r', encoding='utf-8') as f:
-                for line in f:
-                    try:
-                        ans = json.loads(line.strip())
-                        q = ans.get('question', '').lower().strip()
-                        if q:
-                            # Keep the latest version of this question
-                            answers_map[q] = ans
-                    except:
-                        continue
-        except:
+            with open(CURRENT_ANSWER_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    display_list = [a for a in data if a.get('question')]
+                elif isinstance(data, dict) and data.get('question'):
+                    # Backward compat: old single-answer format
+                    display_list = [data]
+        except Exception:
             pass
-            
-    # 2. Add current (always takes priority)
-    current = get_current_answer()
-    if current:
-        q = current.get('question', '').lower().strip()
-        if q:
-            answers_map[q] = current
-            
-    # 3. Sort by timestamp (newest first) and limit to 5
-    sorted_answers = sorted(answers_map.values(), key=lambda x: x.get('timestamp', ''), reverse=True)
-    return sorted_answers[:5]
+
+    # Newest first for display
+    display_list.reverse()
+    return display_list
 
 
 def get_latest_answer() -> Optional[Dict[str, Any]]:
@@ -257,9 +308,6 @@ def clear_and_start_new(question_text: str):
 def start_new_answer(question_text: str):
     """Deprecated: Use set_complete_answer instead."""
     pass
-
-
-# Note: append_answer_chunk is defined above at line 107 for streaming support
 
 
 def finalize_answer():

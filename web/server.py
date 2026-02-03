@@ -88,15 +88,31 @@ def stream():
     """SSE stream for real-time updates - OPTIMIZED for low latency."""
     def event_stream():
         last_data = ""
+        last_mtime = 0.0
+        answer_file = str(answer_storage.CURRENT_ANSWER_FILE)
+
         while True:
-            answers = answer_storage.get_all_answers()
-            current_data = json.dumps(answers)
+            try:
+                # Check file mtime first to avoid unnecessary reads
+                try:
+                    mtime = os.path.getmtime(answer_file)
+                except OSError:
+                    mtime = 0.0
 
-            if current_data != last_data:
-                yield f"data: {current_data}\n\n"
-                last_data = current_data
+                if mtime != last_mtime:
+                    last_mtime = mtime
+                    answers = answer_storage.get_all_answers()
+                    current_data = json.dumps(answers)
 
-            time.sleep(0.05)  # 50ms polling - reduced from 100ms
+                    if current_data != last_data:
+                        yield f"data: {current_data}\n\n"
+                        last_data = current_data
+            except GeneratorExit:
+                return
+            except Exception:
+                pass
+
+            time.sleep(0.1)  # 100ms polling with mtime guard
 
     response = Response(event_stream(), mimetype='text/event-stream')
     # Disable buffering for real-time streaming

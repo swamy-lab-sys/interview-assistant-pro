@@ -154,6 +154,26 @@ FILLER_PATTERNS = [
 COMPILED_FILLERS = [re.compile(p, re.IGNORECASE) for p in FILLER_PATTERNS]
 
 # =============================================================================
+# PHONETIC CORRECTION MAP (pre-compiled)
+# =============================================================================
+
+_PHONETIC_RAW = {
+    "translation": "abstraction",
+    "double": "tuple",
+    "in it method": "__init__ method",
+    "death method": "dev method",
+    "incapacitation": "encapsulation",
+    "gap picking": "pickling",
+    "trickling": "pickling",
+    "pick a link": "pickle",
+    "kill and un": "pickling and un",
+}
+_PHONETIC_MAP = {
+    k: (v, re.compile(re.escape(k), re.IGNORECASE))
+    for k, v in _PHONETIC_RAW.items()
+}
+
+# =============================================================================
 # MINIMUM THRESHOLDS
 # =============================================================================
 
@@ -471,20 +491,11 @@ def validate_question(text: str) -> Tuple[bool, str, str]:
         return False, "", "narration_after_clean"
 
     # Step 4.5: Phonetic Correction (Hard Mapping)
-    phonetic_map = {
-        "translation": "abstraction",
-        "double": "tuple",
-        "in it method": "__init__ method",
-        "death method": "dev method",
-        "incapacitation": "encapsulation",
-        "gap picking": "pickling",
-        "trickling": "pickling",
-        "pick a link": "pickle",
-        "kill and un": "pickling and un",
-    }
-    for mishearing, correction in phonetic_map.items():
-        if mishearing in cleaned.lower():
-            cleaned = re.sub(re.escape(mishearing), correction, cleaned, flags=re.IGNORECASE)
+    cleaned_lower = cleaned.lower()
+    for mishearing, (correction, pattern) in _PHONETIC_MAP.items():
+        if mishearing in cleaned_lower:
+            cleaned = pattern.sub(correction, cleaned)
+            cleaned_lower = cleaned.lower()
 
     # Step 5: Check for CANONICAL question (bypass word count)
     # CRITICAL: "What is Python?" must ALWAYS be accepted

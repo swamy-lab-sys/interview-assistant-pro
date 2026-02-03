@@ -13,11 +13,15 @@ RULES:
 
 import re
 import threading
+from collections import OrderedDict
 from typing import Optional, Dict
 
-# Thread-safe cache
-_cache: Dict[str, str] = {}
+import config
+
+# Thread-safe LRU cache using OrderedDict
+_cache: OrderedDict = OrderedDict()
 _cache_lock = threading.Lock()
+_max_size: int = getattr(config, 'CACHE_MAX_SIZE', 1000)
 
 # Cache stats
 _hits = 0
@@ -82,6 +86,7 @@ def get_cached_answer(question: str) -> Optional[str]:
     with _cache_lock:
         if key in _cache:
             _hits += 1
+            _cache.move_to_end(key)  # Mark as recently used
             return _cache[key]
         _misses += 1
         return None
@@ -101,6 +106,10 @@ def cache_answer(question: str, answer: str) -> None:
 
     with _cache_lock:
         _cache[key] = answer
+        _cache.move_to_end(key)
+        # Evict oldest entries if over max size
+        while len(_cache) > _max_size:
+            _cache.popitem(last=False)
 
 
 def is_duplicate_question(question: str) -> bool:

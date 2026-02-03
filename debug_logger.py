@@ -17,6 +17,7 @@ USAGE:
     log_timing("transcription", 0.342)
 """
 
+import atexit
 import os
 import time
 import threading
@@ -24,7 +25,7 @@ from datetime import datetime
 from pathlib import Path
 from functools import wraps
 from contextlib import contextmanager
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 # Configuration
 LOG_DIR = Path.home() / ".interview_assistant" / "logs"
@@ -42,29 +43,108 @@ _request_start: float = 0
 # Enable/disable logging (can be controlled via env var)
 LOGGING_ENABLED = os.environ.get("INTERVIEW_DEBUG", "1") == "1"
 
+# Directory creation cache
+_dir_ensured = False
+
+# --- Buffered write state ---
+_FLUSH_INTERVAL = 0.5  # Flush buffered logs every 500ms
+_log_buffers: Dict[str, List[str]] = {}  # filepath -> list of lines
+_flush_timer: Optional[threading.Timer] = None
+_flush_running = True
+
 
 def ensure_log_dir():
-    """Create log directory if not exists."""
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    """Create log directory if not exists (cached)."""
+    global _dir_ensured
+    if not _dir_ensured:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        _dir_ensured = True
 
 
-def _write_log(filepath: Path, message: str, include_timestamp: bool = True):
-    """Write to log file (thread-safe)."""
+def _flush_buffers():
+    """Flush all buffered log lines to their respective files."""
+    global _flush_timer
+    with _log_lock:
+        for filepath_str, lines in _log_buffers.items():
+            if not lines:
+                continue
+            try:
+                with open(filepath_str, 'a', encoding='utf-8') as f:
+                    f.write("".join(lines))
+                    f.flush()
+            except Exception:
+                pass
+            lines.clear()
+
+    # Re-schedule if still running
+    if _flush_running:
+        _flush_timer = threading.Timer(_FLUSH_INTERVAL, _flush_buffers)
+        _flush_timer.daemon = True
+        _flush_timer.start()
+
+
+def _start_flush_timer():
+    """Start the periodic flush timer."""
+    global _flush_timer
+    if _flush_timer is None:
+        _flush_timer = threading.Timer(_FLUSH_INTERVAL, _flush_buffers)
+        _flush_timer.daemon = True
+        _flush_timer.start()
+
+
+def _shutdown_logger():
+    """Flush remaining logs on shutdown."""
+    global _flush_running
+    _flush_running = False
+    if _flush_timer:
+        _flush_timer.cancel()
+    # Final flush
+    with _log_lock:
+        for filepath_str, lines in _log_buffers.items():
+            if not lines:
+                continue
+            try:
+                with open(filepath_str, 'a', encoding='utf-8') as f:
+                    f.write("".join(lines))
+                    f.flush()
+            except Exception:
+                pass
+            lines.clear()
+
+
+atexit.register(_shutdown_logger)
+
+
+def _write_log(filepath: Path, message: str, include_timestamp: bool = True, immediate: bool = False):
+    """Write to log file (thread-safe, buffered).
+
+    Args:
+        filepath: Log file path.
+        message: Log message.
+        include_timestamp: Prepend timestamp.
+        immediate: If True, flush to disk right away (for errors).
+    """
     if not LOGGING_ENABLED:
         return
 
     ensure_log_dir()
 
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-    line = f"[{timestamp}] {message}" if include_timestamp else message
+    line = f"[{timestamp}] {message}\n" if include_timestamp else message + "\n"
+
+    filepath_str = str(filepath)
 
     with _log_lock:
-        try:
-            with open(filepath, 'a', encoding='utf-8') as f:
-                f.write(line + "\n")
-                f.flush()
-        except Exception:
-            pass
+        buf = _log_buffers.get(filepath_str)
+        if buf is None:
+            buf = []
+            _log_buffers[filepath_str] = buf
+        buf.append(line)
+
+    if immediate:
+        _flush_buffers()
+    else:
+        _start_flush_timer()
 
 
 def log(message: str, level: str = "DEBUG"):
@@ -75,7 +155,7 @@ def log(message: str, level: str = "DEBUG"):
         message: The message to log
         level: DEBUG, INFO, WARN, ERROR
     """
-    _write_log(DEBUG_LOG, f"[{level}] {message}")
+    _write_log(DEBUG_LOG, f"[{level}] {message}", immediate=(level == "ERROR"))
 
     # Also print to console for real-time monitoring
     if level in ("WARN", "ERROR"):
@@ -97,7 +177,7 @@ def log_error(message: str, exception: Optional[Exception] = None):
     if exception:
         message = f"{message}: {type(exception).__name__}: {exception}"
     log(message, "ERROR")
-    _write_log(ERROR_LOG, message)
+    _write_log(ERROR_LOG, message, immediate=True)
 
 
 def log_timing(component: str, duration_seconds: float, extra: str = ""):
@@ -163,6 +243,9 @@ def end_request(question: str = "", answer_length: int = 0):
     if question:
         perf_line += f" | Q: {question[:50]}"
     _write_log(PERF_LOG, perf_line, include_timestamp=False)
+
+    # Force flush at end of request so performance data is visible
+    _flush_buffers()
 
     # Reset
     _request_start = 0
@@ -282,6 +365,8 @@ def get_log_paths() -> Dict[str, str]:
 
 def clear_logs():
     """Clear all log files."""
+    global _dir_ensured
+    _dir_ensured = False
     ensure_log_dir()
     for log_file in [DEBUG_LOG, PERF_LOG, ERROR_LOG]:
         try:

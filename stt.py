@@ -56,8 +56,8 @@ def transcribe(audio_array):
     segments, info = model.transcribe(
         audio_array,
         beam_size=3,  # Speed over deep search
-        best_of=3,
-        temperature=[0.0, 0.2],
+        best_of=1,
+        temperature=0.0,
         word_timestamps=False,
         # Performance/Robustness
         vad_filter=True,
