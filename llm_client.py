@@ -1,151 +1,384 @@
 """
 LLM Client for Interview Voice Assistant
 
-Supports both streaming and single-shot modes.
-
-Rules:
+Optimized for:
+- Minimal token usage (short system prompt)
+- No conversation history (fresh session per question)
+- Fast responses via streaming
 - 10 second hard timeout
-- 2-3 sentence answers
-- Code only when explicitly asked
 """
 
 import os
 import time
 from anthropic import Anthropic
 
-# Import debug logger
 try:
     import debug_logger as dlog
-    LOGGING_ENABLED = True
 except ImportError:
-    LOGGING_ENABLED = False
     class DlogStub:
         def log(self, *args, **kwargs): pass
         def log_error(self, *args, **kwargs): pass
     dlog = DlogStub()
 
-# Client with 10s timeout
 client = Anthropic(
     api_key=os.environ.get("ANTHROPIC_API_KEY"),
-    max_retries=2,
-    timeout=10.0
+    max_retries=0,   # 0 = fail fast (was 1 = 2x10s=20s total wait on timeout)
+    timeout=12.0     # single attempt, 12s max
 )
 
-# Haiku for speed
-MODEL = "claude-3-haiku-20240307"
+import config as _cfg
+MODEL = os.environ.get("LLM_MODEL_OVERRIDE", _cfg.LLM_MODEL)
 
-# Token limits
-MAX_TOKENS_INTERVIEW = 180  # Definition + code example + use case
-MAX_TOKENS_CODING = 200     # Clean code with example
+MAX_TOKENS_INTERVIEW = 130
+MAX_TOKENS_CODING = 450
+MAX_TOKENS_PLATFORM = 1200
 
-# Temperature - lower = more consistent
-TEMP_INTERVIEW = 0.2
+TEMP_INTERVIEW = 0.4
 TEMP_CODING = 0.1
 
-# Shared interview prompt — controls all response behavior
-INTERVIEW_PROMPT = """You are an Interview Assistant designed for live technical interviews.
-You are NOT a tutor, teacher, or documentation generator.
-Your role is to behave like a real, experienced candidate answering an interviewer in real time.
+INTERVIEW_PROMPT = """You are a senior engineer in a job interview. You ARE the person in the RESUME.
 
-HARD RULES (NEVER VIOLATE):
-1. NEVER echo, repeat, or reference constraints from the question. If asked "do X without Y", just do X. Never write "without Y" or "here's how to do it without Y" in your answer.
-2. When a question is rephrased, your answer MUST use different words and be shorter than the original. Maximum 2-3 sentences. No lists. No bullet points. No expansion. Never copy your previous answer verbatim.
-3. For code answers: output ONLY the code block. No preamble text like "Here's how" or "Here's a solution". Just the code.
-4. Definition questions about generators, decorators, list comprehension, dict comprehension, or iterators MUST include a short definition (1-2 sentences) followed by exactly ONE minimal Python code example (4-6 lines). No extra text after the code. This overrides all other definition rules.
+FORMAT: 3-4 bullet points ONLY. Each bullet is ONE simple sentence under 15 words.
 
-PRIMARY OBJECTIVE:
-- Generate interview-appropriate answers.
-- Answers must be short, direct, context-aware, and human-like.
-- Assume the interviewer is technical.
-- Do not over-explain unless explicitly asked.
+EXAMPLE:
+Q: What is Kubernetes architecture?
+- Kubernetes has a master node and multiple worker nodes
+- Master runs the API server, scheduler, and etcd for cluster state
+- Worker nodes run your application pods managed by kubelet
+- I've used it to deploy and scale microservices in production
 
-CORE RESPONSE RULES (MANDATORY):
-- No greetings, no introductions, no conclusions.
-- Do not restate the question.
-- Do not explain basics unless asked.
-- Avoid teaching or documentation tone.
-- Provide only what the interviewer expects.
-- Stop immediately after answering.
+Q: Difference between list and tuple?
+- Lists are mutable so you can change them after creation
+- Tuples are immutable and slightly faster for read-only data
+- I use tuples for fixed configs and lists for dynamic collections
 
-CONVERSATION AWARENESS:
-- Always consider the previous 1-2 questions.
-- If the current question is a continuation of the previous topic, reuse previous context and do NOT re-explain concepts already covered. Assume shared understanding.
-- If it is unrelated, reset context safely and answer only the new question.
+Q: How to deploy application in AWS?
+- I typically use EC2 instances behind an Application Load Balancer
+- The app is containerized with Docker and deployed via ECS or EKS
+- We set up a CI/CD pipeline using CodePipeline or GitHub Actions
+- CloudWatch handles monitoring and auto-scaling manages traffic spikes
 
-CONTINUATION DETECTION:
-Treat the question as a continuation if it refers to previously created objects or ideas, contains phrases like "using this", "from above", "now", "next", "continue", or stays within the same technical domain (e.g. Python to Python).
+RULES:
+- ONLY 3-4 bullets. NEVER more than 4. NO sub-bullets or nested items.
+- NO colons inside bullets. NO "such as:", "including:", "for example:". Just state it directly.
+- NO paragraphs, NO preamble, NO "let's explain", NO analogies.
+- NO bold, NO code blocks, NO scripts, NO YAML, NO commands, NO brackets, NO technical syntax.
+- ABSOLUTELY NEVER include ```code```, script snippets, YAML, or command-line syntax. Describe steps in plain English only.
+- If asked "how to deploy/set up/configure", describe the approach verbally, never write actual scripts or code.
+- If question sounds garbled, guess the closest tech term and answer it.
+- NEVER say "I don't have experience" or "There is no concept called".
+- NEVER reveal you are AI."""
 
-SCENARIO HANDLING:
-- Career gap then technical question: briefly close the career context, immediately transition to the technical answer. Do not treat them as isolated questions.
-- Step-by-step coding: store previously created objects mentally, reuse them in follow-ups, do NOT recreate unless explicitly asked.
-- Constraint-based questions (e.g. "using slicing", "without loop", "without lambda", "optimize", "time complexity"): follow constraints strictly. NEVER mention, repeat, or reference the constraint in your output text. Do not say "without using X" or "here's how to do it without X". Just provide the code silently respecting the constraint. Do not add alternative approaches.
-- Corrections from interviewer: apply the most recent correction immediately, discard the previous approach, do not justify the change.
-- Partial interruptions: use the corrected instruction, ignore incomplete earlier instructions.
-- Rephrased questions: provide a concise variation, do not repeat the same wording.
-- Unclear or noisy input: provide the safest minimal valid answer, do not ask clarifying questions unless unavoidable.
 
-AUDIO INPUT BEHAVIOR:
-- Assume input may come from live speech.
-- Do not answer mid-sentence.
-- Ignore filler words like "hmm", "okay", "so", "actually".
-- Answer only when intent is clear.
-- If the input is an incomplete fragment (e.g. "What is", "How do", "Explain the"), produce a minimal safe response or just the most likely completion. NEVER ask "could you finish your question" or similar. Treat it as noisy audio and give the shortest safe answer.
+CODING_PROMPT = """You are a human software engineer writing code naturally during an interview.
 
-DEFINITION QUESTION RULE (CRITICAL):
-- If the question starts with "What is", "What are", or "Define", treat it as a definition question.
-- FIRST check if the topic is one of: generators, decorators, list comprehension, dict comprehension, iterators. If YES, follow the DEFINITION WITH EXAMPLE OVERRIDE rule below instead.
-- Otherwise: respond with maximum 2 short sentences OR maximum 2 bullet points.
-- Do NOT include examples unless explicitly asked.
-- Do NOT include use-cases, advantages, or scenarios unless asked.
+CRITICAL: Write code like a REAL HUMAN, not AI. Interviewers can detect AI-generated code.
 
-DEFINITION WITH EXAMPLE OVERRIDE (CONTROLLED):
-- This rule OVERRIDES the definition rule above ONLY for: generators, decorators, list comprehension, dict comprehension, iterators.
-- Provide a short definition (1-2 sentences max), then provide exactly ONE minimal code example.
-- Code example rules: 4-6 lines max, Python only, vertical mobile-friendly, no comments, no explanation text before or after code.
-- Do NOT add multiple examples.
-- Do NOT add usage, advantages, or deep explanation.
-- Stop immediately after the example.
+VARIABLE NAMING (HUMAN STYLE):
+- Use SIMPLE, CASUAL names like real humans do:
+  ✓ Good: arr, temp, res, result, ans, count, i, j, k, curr, prev
+  ✓ Good: nums, words, s, n, m, total, val, key
+  ✗ BAD (too AI-perfect): sorted_word, anagram_dict, word_list, input_string
+  ✗ BAD (too descriptive): reversed_string, anagram_dictionary, character_count
 
-REPHRASED QUESTION RULE (STRICT):
-- If the user asks the same question rephrased or using different words (e.g. "What are X?" followed by "Explain X"), treat it as a request for a concise variation.
-- You MUST rephrase using different words and sentence structure. Do NOT copy your previous answer verbatim.
-- The rephrased answer MUST be shorter than or equal to the original. NEVER expand.
-- Maximum 2-3 sentences. No bullet points. No code. No lists.
-- Do NOT add new information that was not in the original answer.
-- Stop immediately after 2-3 sentences.
+FUNCTION NAMING (HUMAN STYLE):
+- Keep it SHORT and simple:
+  ✓ Good: find, check, get, solve, count, reverse
+  ✗ BAD (too descriptive): find_anagrams, check_palindrome, get_even_numbers
 
-CODE GENERATION RULES:
-- Use Python.
-- Vertical, mobile-friendly formatting.
-- No horizontal scrolling.
-- No comments inside code.
-- No explanation text around code.
+EXAMPLES OF HUMAN CODE:
 
-ANSWER LENGTH CONTROL:
-- Prefer one short code block OR 3-5 bullet points. Never both unless explicitly asked.
-- Stop immediately after satisfying the requirement.
+Problem: "Find anagram groups"
+HUMAN CODE (what you should write):
+def find(words):
+    res = {}
+    for w in words:
+        key = ''.join(sorted(w))
+        if key in res:
+            res[key].append(w)
+        else:
+            res[key] = [w]
+    return list(res.values())
 
-INTERVIEW BEHAVIOR MODEL:
-- Think like a real human in an interview.
-- Assume follow-up questions build on earlier answers.
-- Do not reset context unless the topic clearly changes.
-- Do not anticipate future questions.
-- Do not volunteer extra information.
+AI CODE (NEVER write like this):
+def find_anagrams(word_list):
+    anagram_dict = {}
+    for word in word_list:
+        sorted_word = ''.join(sorted(word))
+        if sorted_word in anagram_dict:
+            anagram_dict[sorted_word].append(word)
+        else:
+            anagram_dict[sorted_word] = [word]
+    return list(anagram_dict.values())
 
-FAIL-SAFE BEHAVIOR:
-- Follow the most recent instruction if conflicts occur.
-- If multiple interpretations exist, choose the simplest interview-safe answer.
+Problem: "Reverse a string"
+HUMAN CODE:
+def reverse(s):
+    return s[::-1]
+
+AI CODE (NEVER):
+def reverse_string(input_string):
+    reversed_string = input_string[::-1]
+    return reversed_string
+
+Problem: "Find even numbers"
+HUMAN CODE:
+def find(arr):
+    return [x for x in arr if x % 2 == 0]
+
+AI CODE (NEVER):
+def find_even_numbers(number_list):
+    even_numbers = [num for num in number_list if num % 2 == 0]
+    return even_numbers
+
+RULES:
+- ZERO text/explanation before or after. Just code.
+- NO comments. NO markdown fencing.
+- SIMPLE variable names (arr, temp, res, i, j, k, n, m, s, w, key, val)
+- SHORT function names (find, check, get, solve, count, reverse)
+- 3-15 lines max (enough for robust logic).
+- For Python: no `if __name__` block.
+- Mix of styles (not perfectly consistent - humans aren't perfect!)
+- For YAML/Ansible/Terraform/Groovy/Dockerfile: output the script directly.
+- For SQL: output the query directly.
+
+REMEMBER: Code should look like it was written by a human in 2-3 minutes, not AI-generated perfection!
 """
 
 
-def get_interview_answer(question: str, resume_text: str = "", include_code: bool = False) -> str:
-    """
-    Get interview answer in SINGLE-SHOT mode (fallback).
-    """
+PLATFORM_PROMPT = """You are an expert competitive programmer. Output WORKING Python code that passes ALL test cases.
+
+INTERNAL THINKING (DO NOT OUTPUT):
+- Identify the problem type (DP, DFS, Greedy, etc.).
+- Analyze constraints (N < 10^5 implies O(N) or O(N log N)).
+- Consider edge cases (empty list, min/max values).
+- Select the OPTIMAL solution.
+
+CRITICAL FORMAT RULES (FOLLOW EXACTLY):
+1. Output ONLY raw Python 3 code - absolutely NO explanations, NO "Here's the code", NO markdown
+2. The VERY FIRST LINE must be 'def' or 'class' - NO text before code
+3. Use EXACT function name from EDITOR_CONTENT
+4. MUST use 4-SPACE INDENTATION for all nested code (this is critical!)
+5. For Codewars/LeetCode: just the function definition, no main block
+6. For HackerRank/Codility: include if __name__ == '__main__'
+7. NO comments, NO print statements for debugging
+
+WORD-TO-NUMBER CONVERSION (parse_int, words_to_int, etc.):
+Use this EXACT pattern with PROPER INDENTATION:
+
+def parse_int(string):
+    nums = {'zero': 0, 'one': 1, 'two': 2, 'three': 3, 'four': 4, 'five': 5,
+            'six': 6, 'seven': 7, 'eight': 8, 'nine': 9, 'ten': 10,
+            'eleven': 11, 'twelve': 12, 'thirteen': 13, 'fourteen': 14,
+            'fifteen': 15, 'sixteen': 16, 'seventeen': 17, 'eighteen': 18,
+            'nineteen': 19, 'twenty': 20, 'thirty': 30, 'forty': 40,
+            'fifty': 50, 'sixty': 60, 'seventy': 70, 'eighty': 80, 'ninety': 90}
+    words = string.replace('-', ' ').replace(' and ', ' ').split()
+    total, current = 0, 0
+    for word in words:
+        if word in nums:
+            current += nums[word]
+        elif word == 'hundred':
+            current *= 100
+        elif word == 'thousand':
+            current *= 1000
+            total += current
+            current = 0
+        elif word == 'million':
+            current *= 1000000
+            total += current
+            current = 0
+        elif word == 'billion':
+            current *= 1000000000
+            total += current
+            current = 0
+    return total + current
+
+KEY ALGORITHM INSIGHTS:
+- "hundred": MULTIPLY current (current *= 100), do NOT add to total
+- "thousand"/"million": SCALE then ADD to total, then RESET current
+- This handles: "seven hundred eighty-three thousand" = (7*100+83)*1000 = 783000
+
+OTHER PATTERNS:
+- Array/List problems: Handle empty arrays, single element, negative numbers
+- String problems: Handle empty string, single char, whitespace
+- Math problems: Handle zero, negative, large numbers
+
+REMEMBER: Every line inside a function MUST start with 4 spaces of indentation!
+Output clean Python code only."""
+
+
+import re
+
+# Pre-compiled AI opener patterns
+_OPENER_PATTERNS = [
+    re.compile(r"^Sure,?\s*", re.IGNORECASE),
+    re.compile(r"^(Great|Good|Excellent|Nice) question[.!,]?\s*", re.IGNORECASE),
+    re.compile(r"^That's a (great|good|excellent) question[.!,]?\s*", re.IGNORECASE),
+    re.compile(r"^Let me explain[.!,:]?\s*", re.IGNORECASE),
+    re.compile(r"^(Certainly|Absolutely|Of course)[.!,]?\s*", re.IGNORECASE),
+    re.compile(r"^Here'?s?\s*(the|my|a)?\s*(answer|explanation|breakdown|overview)?[.!,:]?\s*", re.IGNORECASE),
+    re.compile(r"^(So|Well|Okay|Ok),?\s+", re.IGNORECASE),
+    re.compile(r"^(I'd be happy to|Let me share|Allow me to|I'd like to)[.!,:]?\s*", re.IGNORECASE),
+    re.compile(r"^Okay,?\s*(got it|understood|sure)[.!,]?\s*", re.IGNORECASE),
+    re.compile(r"^(Ah,?\s*)?(I apologize|I'm sorry|My apologies)[^.]*\.\s*", re.IGNORECASE),
+    re.compile(r"^Here are (some of )?(the )?(main |key )?(features|characteristics|benefits|advantages)[^:]*:\s*", re.IGNORECASE),
+    re.compile(r"^(Let me|I'll) (provide|give) (you )?(a |an )?(general )?(overview|explanation|breakdown)[^.]*[.:]\s*", re.IGNORECASE),
+    re.compile(r"^(Let'?s|Let me) explain[^:]*[:.]?\s*", re.IGNORECASE),
+    re.compile(r"^(A |Here'?s a )?(concise|brief|short|quick) (explanation|overview|summary)[^:]*[:.]?\s*", re.IGNORECASE),
+    re.compile(r"^Imagine[^.]*[.:]\s*", re.IGNORECASE),
+    re.compile(r"^Think of[^.]*[.:]\s*", re.IGNORECASE),
+    re.compile(r"^In (simple|plain) terms[,:]?\s*", re.IGNORECASE),
+]
+
+# Pre-compiled formatting patterns
+_BOLD_RE = re.compile(r'\*\*(.+?)\*\*')
+_HEADER_RE = re.compile(r'^#{1,4}\s+', re.MULTILINE)
+_BULLET_RE = re.compile(r'^\s*[-*•]\s+', re.MULTILINE)
+_NUMBERED_RE = re.compile(r'^\s*\d+\.\s+', re.MULTILINE)
+_BOLD_HEADER_RE = re.compile(r'^\s*\*\*[^*]+\*\*\s*:?\s*$', re.MULTILINE)
+
+_CODE_BLOCK_RE = re.compile(r'```[\s\S]*?(?:```|$)')
+_INLINE_CODE_RE = re.compile(r'`([^`]+)`')
+_HERES_EXAMPLE_RE = re.compile(r"Here'?s?\s*(an?\s*)?(simple\s*)?(example|code)[^:]*:\s*", re.IGNORECASE)
+_FOR_EXAMPLE_RE = re.compile(r"For example[,:]?\s*", re.IGNORECASE)
+_KEY_POINTS_RE = re.compile(r"Here are (the |some )?(key |main )?(points|things|features|characteristics)[^:]*:\s*", re.IGNORECASE)
+
+# Pre-compiled AI identity leak patterns (compiled once at module load)
+_AI_LEAK_PATTERNS = [re.compile(p, re.IGNORECASE) for p in [
+    r"As an AI[^.]*\.\s*",
+    r"I am an AI[^.]*\.\s*",
+    r"I'?m an (AI|artificial)[^.]*\.\s*",
+    r"I don'?t have a physical[^.]*\.\s*",
+    r"I do not have a physical[^.]*\.\s*",
+    r"created by Anthropic[^.]*\.\s*",
+    r"I am an artificial intelligence[^.]*\.\s*",
+    r"without a physical form[^.]*\.\s*",
+    r"I cannot (participate|appear|be recorded)[^.]*\.\s*",
+    r"I can only (respond|communicate|provide)[^.]*text[^.]*\.\s*",
+    r"I (apologize|'m sorry|am sorry),?\s*(but\s*)?(I\s*)?(do not|don'?t|am not|cannot)[^.]*\.\s*",
+    r"I'?m afraid[^.]*\.\s*",
+    r"there seems to be (a |some )?misunderstanding[^.]*\.\s*",
+    r"without (any )?more (specific )?details[^.]*\.\s*",
+    r"I do not (actually )?have (any |direct )?(experience|information|knowledge|expertise)[^.]*\.\s*",
+    r"I don'?t have (any |direct )?(experience|information|knowledge|expertise)[^.]*\.\s*",
+    r"I (apologize|'m sorry),?\s*I misunderstood[^.]*\.\s*",
+    r"However,?\s*I can provide[^.]*\.\s*",
+    r"Could you please provide more context[^.]*\.\s*",
+    r"I'?m not sure which[^.]*\.\s*",
+    r"I haven'?t had the (opportunity|need|chance)[^.]*\.\s*",
+    r"As a developer with \d+ years? of experience,?\s*",
+    r"In my experience (working with|as a)[^,]*,\s*",
+]]
+
+def humanize_response(text: str) -> str:
+    """Strip AI-style formatting to produce spoken-style plain text."""
+    if not text:
+        return text
+    # Remove entire code blocks first (```...```)
+    text = _CODE_BLOCK_RE.sub('', text)
+    # Remove inline backticks but keep the text inside
+    text = _INLINE_CODE_RE.sub(r'\1', text)
+    # Strip AI openers
+    for pattern in _OPENER_PATTERNS:
+        text = pattern.sub('', text)
+    # Strip "Here's an example:" and similar
+    text = _HERES_EXAMPLE_RE.sub('', text)
+    text = _FOR_EXAMPLE_RE.sub('', text)
+    text = _KEY_POINTS_RE.sub('', text)
+    # Remove bold-only header lines (e.g., "**Infrastructure Automation**")
+    text = _BOLD_HEADER_RE.sub('', text)
+    # Remove markdown headers (## Header)
+    text = _HEADER_RE.sub('', text)
+    # Remove bold markers but keep inner text
+    text = _BOLD_RE.sub(r'\1', text)
+    # KEEP bullet point markers (- ) since we want bullet format output
+    # But remove numbered list markers (1. 2. 3.)
+    text = _NUMBERED_RE.sub('- ', text)
+    # Remove "Topic: explanation" patterns (e.g., "Memory Efficiency: Generators...")
+    text = re.sub(r'(?m)^\s*[A-Z][A-Za-z\s/]+:\s+', '', text)
+    # Remove label-colon in bullet lines (e.g., "- API Server: Exposes..." → "- API Server exposes...")
+    text = re.sub(r'(?m)^(\s*-\s+[A-Za-z\s/]+):\s+', r'\1 ', text)
+    # Remove trailing "such as:", "including:", "for example:" at end of bullets
+    text = re.sub(r',?\s*(such as|including|for example|e\.g\.)\s*:?\s*$', '.', text, flags=re.MULTILINE | re.IGNORECASE)
+    # Remove sub-bullets (indented bullets like "  - item")
+    text = re.sub(r'(?m)^\s{2,}-\s+.*$', '', text)
+    # Remove label-colon patterns mid-sentence (e.g., "Iterability: Generators are...")
+    text = re.sub(r'(?<=[.!?])\s+[A-Z][A-Za-z\s/]{2,30}:\s+', ' ', text)
+    # Remove e.g. patterns
+    text = re.sub(r'\s*\(e\.g\.?\s*[^)]*\)', '', text)
+    # Remove "etc." trailing (require comma before to avoid destroying words like "etcd")
+    text = re.sub(r',\s+etc\.?\s*', '. ', text)
+    # Remove standalone syntax symbols like [], (), {}, __method__() patterns
+    text = re.sub(r'\s*\[\]\s*', ' ', text)
+    text = re.sub(r'\s*\(\)\s*', ' ', text)
+    text = re.sub(r'\s*\{\}\s*', ' ', text)
+    text = re.sub(r'__\w+__\(\)', '', text)  # __enter__(), __exit__(), __init__()
+    text = re.sub(r'__\w+__', '', text)  # __init__, __str__, etc.
+    # Remove "Note that..." filler sentences
+    text = re.sub(r'\(Note that[^)]*\)', '', text)
+    text = re.sub(r'Note that[^.]*\.\s*', '', text)
+    # Remove "It is important to note..." filler
+    text = re.sub(r'It is important to (note|understand|remember)[^.]*\.\s*', '', text, flags=re.IGNORECASE)
+    # Collapse multiple newlines but preserve single newlines for bullet format
+    text = re.sub(r'\n{3,}', '\n', text)
+    text = re.sub(r'\n\n', '\n', text)
+    # Collapse multiple spaces
+    text = re.sub(r'  +', ' ', text)
+    # Remove AI identity leaks and "I don't have experience" patterns (pre-compiled)
+    for pattern in _AI_LEAK_PATTERNS:
+        text = pattern.sub("", text)
+    # Collapse spaces and periods after removals
+    text = re.sub(r'\.{2,}', '.', text)
+    text = re.sub(r'  +', ' ', text)
+    text = re.sub(r'^\s*[,.]\s*', '', text)
+    text = text.strip()
+
+    # Limit to max 4 bullet points (drop excess bullets)
+    lines = text.split('\n')
+    bullet_count = 0
+    truncated_lines = []
+    for line in lines:
+        if line.strip().startswith('-'):
+            bullet_count += 1
+            if bullet_count > 4:
+                break
+        truncated_lines.append(line)
+    text = '\n'.join(truncated_lines).strip()
+
+    return text
+
+
+def clear_session():
+    """Clear any session state. Called between questions for isolation."""
+    HISTORY.clear()
+
+
+
+# Global conversation history (deque for O(1) popleft)
+from collections import deque
+HISTORY = deque(maxlen=3)
+
+def get_interview_answer(question: str, resume_text: str = "", job_description: str = "", include_code: bool = False) -> str:
+    """Single-shot interview answer with history context."""
     system_prompt = INTERVIEW_PROMPT
 
-    start_time = time.time()
-    dlog.log(f"[LLM] Single-shot request: {question[:50]}...", "DEBUG")
+    if resume_text:
+        system_prompt += f"\n\nYOUR RESUME (answer as this person):\n{resume_text}"
+
+    if job_description:
+        system_prompt += f"\n\nJOB DESCRIPTION (tailor answers to this):\n{job_description}"
+
+    dlog.log(f"[LLM] Single-shot: {question[:60]}", "DEBUG")
+
+    # Build messages with history
+    messages = []
+    for q, a in HISTORY:
+        messages.append({"role": "user", "content": q})
+        messages.append({"role": "assistant", "content": a})
+    messages.append({"role": "user", "content": question})
+    # Prefill to force bullet format (prevents preamble)
+    messages.append({"role": "assistant", "content": "-"})
 
     try:
         api_start = time.time()
@@ -154,80 +387,133 @@ def get_interview_answer(question: str, resume_text: str = "", include_code: boo
             max_tokens=MAX_TOKENS_INTERVIEW,
             temperature=TEMP_INTERVIEW,
             system=system_prompt,
-            messages=[{"role": "user", "content": question}]
+            messages=messages
         )
         api_time = time.time() - api_start
+        answer = humanize_response("-" + response.content[0].text.strip())
 
-        elapsed = time.time() - start_time
-        answer = response.content[0].text.strip()
-
-        dlog.log(f"[LLM] Single-shot complete: {len(answer)} chars in {api_time*1000:.0f}ms", "DEBUG")
+        # Update history (deque auto-evicts oldest when full)
+        HISTORY.append((question, answer))
+            
+        dlog.log(f"[LLM] Done: {len(answer)} chars in {api_time*1000:.0f}ms", "DEBUG")
         return answer
 
     except Exception as e:
-        elapsed = time.time() - start_time
-        dlog.log_error(f"[LLM] Single-shot failed after {elapsed*1000:.0f}ms", e)
-        print(f"[LLM ERROR] {elapsed:.2f}s | {e}")
-        return ""  # Return empty on error - silence is better
+        dlog.log_error("[LLM] Single-shot failed", e)
+        return ""
 
 
-def get_streaming_interview_answer(question: str, resume_text: str = ""):
-    """
-    Get interview answer in STREAMING mode.
-    Yields chunks of text.
-    """
+def get_streaming_interview_answer(question: str, resume_text: str = "", job_description: str = ""):
+    """Streaming interview answer with history context."""
     system_prompt = INTERVIEW_PROMPT
 
-    dlog.log(f"[LLM] Streaming request: {question[:50]}...", "DEBUG")
-    stream_start = time.time()
-    chunk_count = 0
-    total_chars = 0
-    first_chunk_time = None
+    if resume_text:
+        system_prompt += f"\n\nYOUR RESUME (answer as this person):\n{resume_text}"
 
+    if job_description:
+        system_prompt += f"\n\nJOB DESCRIPTION (tailor answers to this):\n{job_description}"
+
+    dlog.log(f"[LLM] Streaming: {question[:60]}", "DEBUG")
+    stream_start = time.time()
+
+    # Build messages with history
+    messages = []
+    for q, a in HISTORY:
+        messages.append({"role": "user", "content": q})
+        messages.append({"role": "assistant", "content": a})
+    messages.append({"role": "user", "content": question})
+    # Prefill to force bullet format
+    messages.append({"role": "assistant", "content": "-"})
+
+    full_answer = "-"
     try:
+        yield "-"
         with client.messages.stream(
             model=MODEL,
             max_tokens=MAX_TOKENS_INTERVIEW,
             temperature=TEMP_INTERVIEW,
             system=system_prompt,
-            messages=[{"role": "user", "content": question}]
+            messages=messages
         ) as stream:
             for text in stream.text_stream:
-                chunk_count += 1
-                total_chars += len(text)
-                if first_chunk_time is None:
-                    first_chunk_time = time.time() - stream_start
-                    dlog.log(f"[LLM] First chunk in {first_chunk_time*1000:.0f}ms", "DEBUG")
+                full_answer += text
                 yield text
 
-        total_time = time.time() - stream_start
-        dlog.log(f"[LLM] Stream complete: {total_chars} chars, {chunk_count} chunks in {total_time*1000:.0f}ms", "DEBUG")
+        # Update history after stream completes
+        HISTORY.append((question, full_answer))
+        if len(HISTORY) > MAX_HISTORY:
+            HISTORY.pop(0)
+
+        dlog.log(f"[LLM] Stream done in {(time.time() - stream_start)*1000:.0f}ms", "DEBUG")
 
     except Exception as e:
-        elapsed = time.time() - stream_start
-        dlog.log_error(f"[LLM] Stream failed after {elapsed*1000:.0f}ms", e)
-        print(f"[LLM STREAM ERROR] {e}")
+        dlog.log_error("[LLM] Stream failed", e)
         yield ""
 
 
+def _clean_code_answer(text: str) -> str:
+    """Strip any text preamble/explanation from code answers, keep only code."""
+    if not text:
+        return text
+    # Remove markdown code fences
+    text = re.sub(r'^```\w*\n?', '', text)
+    text = re.sub(r'\n?```$', '', text)
+    text = text.strip()
+    # If starts with text preamble (not code), strip everything before first code line
+    lines = text.split('\n')
+    code_start_idx = 0
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if (stripped.startswith('def ') or stripped.startswith('class ') or
+            stripped.startswith('import ') or stripped.startswith('from ') or
+            stripped.startswith('if ') or stripped.startswith('for ') or
+            stripped.startswith('while ') or stripped.startswith('#') or
+            re.match(r'^[a-z_]\w*\s*=', stripped) or
+            stripped.startswith('- hosts:') or stripped.startswith('- hosts ') or
+            stripped.startswith('- name:') or stripped.startswith('---') or
+            # Terraform patterns
+            stripped.startswith('provider ') or stripped.startswith('resource ') or
+            stripped.startswith('variable ') or stripped.startswith('output ') or
+            stripped.startswith('terraform {') or stripped.startswith('data ') or
+            stripped.startswith('module ') or stripped.startswith('locals {') or
+            # Dockerfile patterns
+            stripped.startswith('FROM ') or stripped.startswith('RUN ') or
+            stripped.startswith('COPY ') or stripped.startswith('CMD ') or
+            stripped.startswith('WORKDIR ') or stripped.startswith('EXPOSE ') or
+            # SQL patterns
+            stripped.upper().startswith('SELECT ') or stripped.upper().startswith('CREATE ') or
+            stripped.upper().startswith('INSERT ') or stripped.upper().startswith('ALTER ') or
+            # Groovy/Jenkins
+            stripped.startswith('pipeline {') or stripped.startswith('node {') or
+            stripped.startswith('stage(')):
+            code_start_idx = i
+            break
+    if code_start_idx > 0:
+        text = '\n'.join(lines[code_start_idx:]).strip()
+    # Remove trailing explanation text after the code
+    final_lines = []
+    code_ended = False
+    for line in text.split('\n'):
+        if code_ended:
+            break
+        # If we hit an empty line after code, check if next line looks like text
+        if not line.strip() and final_lines:
+            final_lines.append(line)
+            continue
+        # Text explanation lines (no indentation, starts with "This", "Here", "The", etc.)
+        if (final_lines and not line.startswith(' ') and not line.startswith('\t') and
+            re.match(r'^(This|Here|The|It|Note|Output|Example|Usage|How|You)', line)):
+            break
+        final_lines.append(line)
+    # Remove trailing empty lines
+    while final_lines and not final_lines[-1].strip():
+        final_lines.pop()
+    return '\n'.join(final_lines)
+
+
 def get_coding_answer(question: str) -> str:
-    """
-    Get coding answer in SINGLE-SHOT mode.
-    Clean, professional code with example
-    """
-    system_prompt = """You are a candidate in a live technical interview. Write clean Python code only.
-
-RULES:
-- Code only. No greetings, no restating the question.
-- Vertical, mobile-friendly formatting. No horizontal scrolling.
-- No comments inside code.
-- 5-10 lines max. Include a quick example usage.
-- No over-engineering. Write what you'd actually write at work.
-- Stop immediately after the code.
-"""
-
-    start_time = time.time()
-    dlog.log(f"[LLM] Coding request: {question[:50]}...", "DEBUG")
+    """Single-shot coding answer. Clean executable Python only."""
+    dlog.log(f"[LLM] Coding: {question[:60]}", "DEBUG")
 
     try:
         api_start = time.time()
@@ -235,19 +521,82 @@ RULES:
             model=MODEL,
             max_tokens=MAX_TOKENS_CODING,
             temperature=TEMP_CODING,
-            system=system_prompt,
+            system=CODING_PROMPT,
             messages=[{"role": "user", "content": question}]
         )
-        api_time = time.time() - api_start
-
-        elapsed = time.time() - start_time
-        answer = response.content[0].text.strip()
-
-        dlog.log(f"[LLM] Coding complete: {len(answer)} chars in {api_time*1000:.0f}ms", "DEBUG")
+        answer = _clean_code_answer(response.content[0].text.strip())
+        dlog.log(f"[LLM] Coding done: {len(answer)} chars in {(time.time() - api_start)*1000:.0f}ms", "DEBUG")
         return answer
 
     except Exception as e:
-        elapsed = time.time() - start_time
-        dlog.log_error(f"[LLM] Coding failed after {elapsed*1000:.0f}ms", e)
-        print(f"[LLM-CODE ERROR] {elapsed:.2f}s | {e}")
-        return ""  # Return empty on error - silence is better
+        dlog.log_error("[LLM] Coding failed", e)
+        return ""
+
+
+def get_platform_solution(problem_text: str, editor_content: str = "", url: str = "") -> str:
+    """Generate solution for coding platforms (##start mode)."""
+    dlog.log(f"[LLM] Platform solve: {url[:40]}", "DEBUG")
+
+    user_content = f"URL: {url}\n\nEDITOR_CONTENT:\n{editor_content}\n\nPROBLEM_TEXT:\n{problem_text}"
+
+    try:
+        api_start = time.time()
+        response = client.messages.create(
+            model=MODEL,
+            max_tokens=MAX_TOKENS_PLATFORM,
+            temperature=0.0,
+            system=PLATFORM_PROMPT,
+            messages=[{"role": "user", "content": user_content}]
+        )
+
+        answer = response.content[0].text.strip()
+
+        # Strip common LLM explanation phrases
+        unwanted_prefixes = [
+            "Here's the Python code",
+            "Here is the Python code",
+            "Here's the code",
+            "Here is the code",
+            "Here's my solution",
+            "Here is my solution",
+            "The solution is",
+            "Below is the",
+            "This code",
+        ]
+        for prefix in unwanted_prefixes:
+            if answer.lower().startswith(prefix.lower()):
+                # Find where the actual code starts (after : or newline)
+                idx = answer.find(':')
+                if idx != -1 and idx < 100:
+                    answer = answer[idx+1:].strip()
+                else:
+                    idx = answer.find('\n')
+                    if idx != -1:
+                        answer = answer[idx+1:].strip()
+                break
+
+        if answer.startswith("```"):
+            answer = answer.split("\n", 1)[1] if "\n" in answer else answer
+        if answer.endswith("```"):
+            answer = answer.rsplit("\n", 1)[0] if "\n" in answer else answer
+        # Also handle ```python specifically
+        if answer.startswith("```python"):
+            answer = answer[9:].strip()
+
+        lines = answer.split('\n')
+        clean_lines = []
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith('#') and not stripped.startswith('#!'):
+                continue
+            if '#' in line and "'" not in line and '"' not in line:
+                line = line.split('#')[0].rstrip()
+            clean_lines.append(line)
+
+        answer = '\n'.join(clean_lines).strip()
+        dlog.log(f"[LLM] Platform done: {len(answer)} chars in {(time.time() - api_start)*1000:.0f}ms", "DEBUG")
+        return answer
+
+    except Exception as e:
+        dlog.log_error("[LLM] Platform failed", e)
+        return ""

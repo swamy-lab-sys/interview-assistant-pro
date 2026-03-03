@@ -1,9 +1,10 @@
 {
   "manifest_version": 3,
   "name": "Interview Assistant Helper",
-  "version": "1.0",
-  "description": "Discreetly view interview answers from your local assistant.",
+  "version": "1.2",
+  "description": "Interview assistant popup window for viewing answers. Typing handled by Programiz CodeTyper.",
   "permissions": [
+    "activeTab",
     "storage",
     "system.display"
   ],

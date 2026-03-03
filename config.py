@@ -1,85 +1,74 @@
 """
 Configuration for Interview Voice Assistant
 
-PRODUCTION SETTINGS - Optimized for latency and reliability.
-
-DESIGN PRINCIPLES:
-- Fast responses (< 4s target)
-- No microphone blocking
-- Graceful degradation
-- Single-shot LLM (no streaming)
+PRODUCTION SETTINGS - Optimized for latency and token efficiency.
 """
+import os
 
 # =============================================================================
 # Audio Configuration
 # =============================================================================
 
-AUDIO_SAMPLE_RATE = 16000  # Hz (required for Whisper)
-AUDIO_CHANNELS = 1          # Mono
-AUDIO_CHUNK_DURATION_MS = 30  # VAD frame size (10, 20, or 30)
+AUDIO_SAMPLE_RATE = 16000
+AUDIO_CHANNELS = 1
+AUDIO_CHUNK_DURATION_MS = 20  # Reduced for faster processing
 
 # Voice Activity Detection
-# Voice Activity Detection
-VAD_AGGRESSIVENESS = 2      # 0-3, lowered for better continuity
-VAD_PADDING_MS = 500        # Maximum padding to prevent syllable cut-off
+VAD_AGGRESSIVENESS = 1  # Less aggressive = faster processing
+VAD_PADDING_MS = 800  # Increased padding to capture full sentences
 
-# Recording limits - OPTIMIZED FOR YOUTUBE
-MAX_RECORDING_DURATION = 6.0    # Short window to catch ONLY the question
-MIN_AUDIO_LENGTH = 0.3          # seconds
+# Recording limits
+MAX_RECORDING_DURATION = 15.0  # Increased from 8.0s to allow full questions
+MIN_AUDIO_LENGTH = 0.5
 
 # =============================================================================
-# Adaptive Silence Detection - FINAL OPTIMIZED
+# Adaptive Silence Detection
 # =============================================================================
 
-SILENCE_DEFAULT = 0.5   # ULTRA FAST (User request)
-SILENCE_YOUTUBE = 0.8   # Faster YouTube
-SILENCE_MEET = 0.8
-SILENCE_ZOOM = 0.8
-SILENCE_TEAMS = 0.8
+SILENCE_DEFAULT = 1.2  # Reduced for faster response (balanced)
+SILENCE_YOUTUBE = 1.0
+SILENCE_MEET = 1.2
+SILENCE_ZOOM = 1.2
+SILENCE_TEAMS = 1.2
 
 # =============================================================================
 # Speech-to-Text (Whisper)
 # =============================================================================
 
-STT_MODEL = "tiny.en"   # LIGHTWEIGHT & FAST (User request)
-STT_DEVICE = None       # Auto-detect (cuda/cpu)
+STT_MODEL = os.environ.get("STT_MODEL_OVERRIDE", "small.en")
+STT_DEVICE = None
 
 # =============================================================================
 # LLM Configuration (Claude)
 # =============================================================================
 
-LLM_MODEL = "claude-3-haiku-20240307"  # Fastest Claude model
-LLM_MAX_TOKENS_INTERVIEW = 200         # Short answers
-LLM_MAX_TOKENS_CODING = 512            # Code needs more
-LLM_TEMPERATURE_INTERVIEW = 0.3        # Consistent
-LLM_TEMPERATURE_CODING = 0.2           # Deterministic
-LLM_TIMEOUT = 10.0                     # seconds
+LLM_MODEL = os.environ.get("LLM_MODEL_OVERRIDE", "claude-sonnet-4-20250514")
+LLM_MAX_TOKENS_INTERVIEW = 130  # 3-4 short bullet points, hard cap
+LLM_MAX_TOKENS_CODING = 450
+LLM_TEMPERATURE_INTERVIEW = 0.4  # Higher for more natural human-like speech
+LLM_TEMPERATURE_CODING = 0.1
+LLM_TIMEOUT = 10.0
 
 # =============================================================================
 # Timing & Latency
 # =============================================================================
 
-COOLDOWN_BASE = 0.5           # Snappier recovery
-COOLDOWN_PER_CHAR = 0.002     # Faster reading assumption
-COOLDOWN_CODE_BONUS = 1.0     # Less wait for code
+COOLDOWN_BASE = 0.5
+COOLDOWN_PER_CHAR = 0.002
+COOLDOWN_CODE_BONUS = 1.0
+COOLDOWN_DURATION = 2.0
+DEDUP_WINDOW = 5.0
 
-# Cooldown after answer (prevents rapid re-triggering)
-COOLDOWN_DURATION = 2.0  # seconds
-
-# Deduplication window (same question ignored)
-DEDUP_WINDOW = 5.0  # seconds
-
-# Latency targets (for logging/monitoring)
-TARGET_SIMPLE_QUESTION_MS = 2000   # < 2s for simple questions
-TARGET_COMPLEX_QUESTION_MS = 4000  # < 4s for complex questions
-TARGET_CACHE_HIT_MS = 500          # < 0.5s for cached answers
+TARGET_SIMPLE_QUESTION_MS = 2000
+TARGET_COMPLEX_QUESTION_MS = 4000
+TARGET_CACHE_HIT_MS = 500
 
 # =============================================================================
 # Answer Caching
 # =============================================================================
 
 ENABLE_CACHE = True
-CACHE_MAX_SIZE = 1000  # Max cached questions
+CACHE_MAX_SIZE = 1000
 
 # =============================================================================
 # Web UI
@@ -92,15 +81,16 @@ WEB_HOST = "0.0.0.0"
 # Paths
 # =============================================================================
 
-RESUME_PATH = "resume.txt"
+RESUME_PATH = os.environ.get("RESUME_PATH", "resume.txt")
+JD_PATH = "job_description.txt"
 ANSWERS_DIR = "~/.interview_assistant"
 
 # =============================================================================
-# Debug (Disabled in production)
+# Debug (ALL OFF for production)
 # =============================================================================
 
 DEBUG = False
-VERBOSE = True                  # Re-enabled for final verification
+VERBOSE = True
 LOG_TO_FILE = True
-DEBUG_MODE = True
-SAVE_DEBUG_AUDIO = True
+DEBUG_MODE = False
+SAVE_DEBUG_AUDIO = False

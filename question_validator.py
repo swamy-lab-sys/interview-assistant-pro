@@ -1,740 +1,760 @@
 """
-Strict Interview Question Validator
+Interview Question Validator
 
-PHILOSOPHY: Silence is better than a wrong answer.
-If ANY doubt → reject.
-
-Rules:
-1. Must contain interview verb (what is, explain, difference between, etc.)
-2. Minimum 5 words
-3. Must NOT end with incomplete marker (and, of, between, to, with, etc.)
-4. Must NOT be narration/teaching
-5. Must NOT be casual/practice content
+Accepts real interview questions, rejects:
+- YouTube/tutorial audio
+- Fillers, noise, hallucinations
+- Platform commands
 """
 
 import re
 from typing import Tuple
+from collections import Counter
 
-INTERVIEW_VERBS = [
-    # Core interrogative intent (User requested: what, why, how, explain, difference, define, compare)
+
+# =============================================================================
+# STT CORRECTION - Fix common Whisper misheard terms
+# =============================================================================
+
+STT_CORRECTIONS = {
+    # CI/CD misheard variants
+    r"\ba,?\s*c,?\s*d\b": "CI CD",
+    r"\ba c d\b": "CI CD",
+    r"\bca cd\b": "CI CD",
+    r"\bc a c d\b": "CI CD",
+    r"\bci cd\b": "CI/CD",
+    r"\bci slash cd\b": "CI/CD",
+    r"\bcontinuous integration continuous (delivery|deployment)\b": "CI/CD",
+    r"\bsee\s*eye\s*see\s*dee\b": "CI/CD",
+    r"\bintegration\s*continuous\b": "CI/CD",
+    # SSH
+    r"\bs s h\b": "SSH",
+    r"\bss h\b": "SSH",
+    # Django (many misheard variants)
+    r"\bjungle\b": "Django",
+    r"\bjango\b": "Django",
+    r"\bdd\s*jango\b": "Django",
+    r"\bd\s*django\b": "Django",
+    r"\bddjango\b": "Django",
+    # Python misheard
+    r"\b4[\s-]*by[\s-]*thon\b": "Python",
+    r"\bfour[\s-]*by[\s-]*thon\b": "Python",
+    # Serializer
+    r"\bserial address\b": "serializer",
+    r"\bserial izer\b": "serializer",
+    # Kubernetes
+    r"\bcubernetes\b": "Kubernetes",
+    r"\bcuber netties\b": "Kubernetes",
+    r"\bk8s\b": "Kubernetes",
+    # Other common mishearings
+    r"\breston tuple\b": "list and tuple",
+    r"\bpost grass\b": "PostgreSQL",
+    r"\bpost gress\b": "PostgreSQL",
+    r"\bred is\b": "Redis",
+    r"\baws lamba\b": "AWS Lambda",
+    # Palindrome
+    r"\bball and rum\b": "Palindrome",
+    r"\bpal and rom\b": "Palindrome",
+    # Kubernetes terms
+    r"\bconflict\s*map\b": "ConfigMap",
+    r"\bconfig\s*map\b": "ConfigMap",
+    r"\bsecrete?\b": "Secret",
+    # Terraform
+    r"\bterra\s*form\b": "Terraform",
+    r"\bterraform applet\b": "Terraform apply",
+    r"\bterra form apply\b": "Terraform apply",
+    # Ansible
+    r"\bansible\b": "Ansible",
+    # Kafka
+    r"\bcafka\b": "Kafka",
+    r"\bkafka\b": "Kafka",
+    # Grafana
+    r"\bgrafana\b": "Grafana",
+    r"\bgra fana\b": "Grafana",
+    # kubectl
+    r"\bkubectl locks\b": "kubectl logs",
+    r"\bkubectl\b": "kubectl",
+    # Django commands misheard
+    r"\bmeet\s*migrations?\b": "makemigrations",
+    r"\bmeat\s*migrations?\b": "makemigrations",
+    r"\bmake\s*migrations?\b": "makemigrations",
+    # *args/**kwargs misheard
+    r"\barcs?\s*and\s*kw\s*arcs?\b": "*args and **kwargs",
+    r"\barks?\s*and\s*kw\s*arks?\b": "*args and **kwargs",
+    r"\barcs?\s*and\s*kwas?\b": "*args and **kwargs",
+    r"\barks?\s*and\s*kwas?\b": "*args and **kwargs",
+    # Generator misheard
+    r"\bgenerate?\s*trip\b": "generator",
+    r"\bgenerator\s*trip\b": "generator",
+    # Microservices misheard
+    r"\bmicro\s*letic\b": "microservices",
+    r"\bmicro\s*litic\b": "microservices",
+    # JWT misheard as GWT
+    r"\bgwt\b": "JWT",
+    r"\bg\s*w\s*t\b": "JWT",
+    # Django ORM misheard
+    r"\bdjango\s*over\s*m\b": "Django ORM",
+    # CORS misheard
+    r"\bcars\s*error": "CORS error",
+    # Nginx misheard
+    r"\bnvidia\s*architecture\s*engine\b": "Nginx",
+    # "Write" misheard as "Right here/Right there/Righty" at sentence start
+    r"^right\s+here,?\s*": "Write a ",
+    r"^right\s+there,?\s*": "Write a ",
+    r"^righty\s+": "Write an ",
+    # Noise prefixes (garbage before real question)
+    r"^async\s+out\s+there\.?\s*": "",
+    # "explain" misheard as "ask my"
+    r"\bask\s+my\b": "explain",
+    # OpenStack terms misheard
+    r"\bopen\s*sit\b": "OpenShift",
+    r"\bopen[\s-]*set\b": "OpenShift",
+    r"\bopen\s*savio\b": "OpenStack",
+    r"\bopen\s*sav\w+\b": "OpenStack",
+    r"\bnawakama\b": "nova.conf",
+    r"\bnf[\s_-]?com[\s_-]?track[\s_-]?mo\w*\b": "nf_conntrack",
+    r"\bnf\s*com\s*track\b": "nf_conntrack",
+    r"\bobvious\s+system\b": "OVS",
+    r"\bself[\s-]state\b": "ERROR state",
+    r"\bopen\s*stack\b": "OpenStack",
+    r"\bopen\s*shift\b": "OpenShift",
+    # Linux patching misheard
+    r"\bdf[\s-]fn\w+\b": "df -h",
+    r"\bdfa[\s-]f\w+\b": "df -h",
+    # KVM/QEMU misheard
+    r"\bkevm\b": "KVM",
+    r"\bkolla\s+ansible\b": "Kolla-Ansible",
+}
+
+COMPILED_STT_CORRECTIONS = [(re.compile(p, re.IGNORECASE), r) for p, r in STT_CORRECTIONS.items()]
+
+
+
+def apply_stt_corrections(text: str) -> str:
+    """Fix common Whisper misheard technical terms."""
+    for pattern, replacement in COMPILED_STT_CORRECTIONS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
+# =============================================================================
+# VAGUE QUESTION DETECTION - Reject pronoun-only follow-ups
+# =============================================================================
+
+VAGUE_PRONOUNS = {"it", "this", "that", "them", "they", "those", "these", "its"}
+
+def is_vague_question(text: str) -> bool:
+    """Reject vague follow-up questions with only pronouns, no specific subject.
+
+    Examples rejected:
+    - "How do you implement it?"
+    - "Can you explain that?"
+    - "What does it do?"
+
+    Examples allowed:
+    - "How do you implement CI/CD?" (has tech term)
+    - "What is Docker?" (has tech term)
+    """
+    lower = text.lower().strip().rstrip("?.,!")
+    words = lower.split()
+
+    if len(words) < 3 or len(words) > 8:
+        return False
+
+    # Check if any real tech term exists
+    has_tech = any(t in lower for t in TECH_TERMS)
+    if has_tech:
+        return False
+
+    # Check if the only "subject" words are pronouns
+    filler_words = {"how", "do", "does", "did", "you", "we", "can", "could", "would",
+                    "should", "will", "what", "is", "are", "was", "were", "a", "an",
+                    "the", "to", "for", "in", "on", "about", "explain", "describe",
+                    "tell", "me", "implement", "use", "work", "mean", "define"}
+
+    subject_words = [w for w in words if w not in filler_words and w not in VAGUE_PRONOUNS]
+
+    # If no subject words AND has a vague pronoun -> reject
+    if not subject_words and any(w in VAGUE_PRONOUNS for w in words):
+        return True
+
+    return False
+
+
+# =============================================================================
+# YOUTUBE / TUTORIAL DETECTION - Reject non-interview audio
+# =============================================================================
+
+YOUTUBE_PATTERNS = [
+    r"subscribe", r"like and subscribe", r"hit the bell",
+    r"in this video", r"in today's video", r"in this tutorial",
+    r"welcome to (my|this|the) (channel|video|tutorial|course|series)",
+    r"hey (guys|everyone|everybody)", r"what's up (guys|everyone)",
+    r"hello (everyone|guys|friends)", r"hi (guys|everyone)",
+    r"let's (get started|begin|dive|jump|look)", r"let me show you",
+    r"as you can see", r"on (the|your) screen",
+    r"first (we need to|let's|we will|we'll)", r"step (one|two|three|1|2|3)",
+    r"(next|now) (we|let's|I'll|I will|we'll)", r"moving on to",
+    r"(click|go to|navigate|open) (on|the|this|here)",
+    r"(link|links) (in|is in) (the|my) description",
+    r"(leave|drop) a comment", r"comment (below|down)",
+    r"share this video", r"don't forget to",
+    r"thanks for watching", r"see you (in the|next)",
+    r"(if you|you should) (liked|enjoyed|found)", r"please (like|share|subscribe)",
+    r"(sponsored|brought to you) by",
+    r"(check out|visit) (my|our|the) (website|patreon|github|link)",
+    r"before we (start|begin|continue|proceed)",
+    r"(so|okay|alright|now),?\s+(let's|I'll|we'll|let me)\s+(start|begin|install|setup|configure|learn|see|look|run|open|create|build|go|do|move|jump|proceed|continue|check)",
+    r"(chapter|section|part) (one|two|three|\d+)",
+    r"(prerequisite|before you|you need to) (know|have|install|understand)",
+    r"(watch|see) (my|the) (previous|last|earlier|other) video",
+    r"(i'll|i will|we'll|we will) (explain|show|demonstrate|walk you through)",
+    r"(follow along|code along|type along)",
+    r"(here|this) is (the|a|my|our) (output|result|demo|example)",
+    r"(pause|stop) (the|this) video",
+    r"(python|programming|coding) (tutorial|course|lesson|series|bootcamp)",
+    r"(beginner|intermediate|advanced) (guide|tutorial|course)",
+    r"(learn|learning|master|mastering) (python|programming|coding|django)",
+]
+
+COMPILED_YOUTUBE = [re.compile(p, re.IGNORECASE) for p in YOUTUBE_PATTERNS]
+
+
+def is_youtube_or_tutorial(text: str) -> bool:
+    """Detect YouTube/tutorial audio content (not interview questions)."""
+    if not text or len(text) < 10:
+        return False
+
+    lower = text.lower()
+
+    for pattern in COMPILED_YOUTUBE:
+        if pattern.search(lower):
+            return True
+
+    words = lower.split()
+    if len(words) > 40:
+        return True
+
+    if len(words) > 20:
+        tutorial_words = {'video', 'tutorial', 'channel', 'subscribe', 'course',
+                          'lesson', 'click', 'link', 'website', 'download',
+                          'install', 'setup', 'screen', 'demo', 'example',
+                          'output', 'result', 'step', 'chapter', 'section'}
+        found = sum(1 for w in words if w in tutorial_words)
+        if found >= 3:
+            return True
+
+    return False
+
+
+# =============================================================================
+# QUESTION STARTERS
+# =============================================================================
+
+QUESTION_STARTERS = [
     "what is", "what are", "what does", "what do", "what's",
     "why is", "why do", "why does", "why would",
     "how do", "how does", "how to", "how can", "how would",
-    "explain", "describe", "define", "compare",
-    "difference between", "differences between", "what's the difference", "what is the difference",
-
-    # Technical interview specifics
-    "walk me through", "walk through", "tell me about",
-    "write code", "write a function", "implement",
-    "can you explain", "could you explain",
-    "what happens when", "what happens if", "concept of",
-    "tell me", "explain about", "briefly", "how to use", "how to implement",
-    "write a", "implement a", "create a", "function to", "logic to",
-
-    # MCQ-style patterns (common in technical interviews)
-    "which of", "which one", "which statement", "which method", "which function",
-    "which data type", "which keyword", "which operator", "which module",
-    "output of", "result of", "value of", "type of",
-    "maximum", "minimum", "default", "correct", "true about", "false about",
-    "following is", "following are", "not supported", "does not", "cannot",
-    "possible length", "possible value", "possible output",
+    "when do", "when does", "when should", "when would",
+    "where do", "where does", "where is",
+    "which", "is there", "are there", "can you", "could you",
+    "explain", "describe", "define", "compare", "tell me",
+    "difference between", "walk me through",
+    "write", "implement", "create", "give me",
+    "have you", "do you have", "how much", "how many years",
 ]
 
-# =============================================================================
-# INCOMPLETE SENTENCE MARKERS - Sentence cannot end with these
-# =============================================================================
+TECH_TERMS = {
+    "python", "class", "function", "method", "decorator", "generator",
+    "list", "tuple", "dict", "dictionary", "set", "string", "array",
+    "inheritance", "polymorphism", "encapsulation", "abstraction",
+    "django", "flask", "api", "rest", "database", "sql", "orm",
+    "docker", "kubernetes", "aws", "git", "ci/cd", "pipeline",
+    "async", "await", "thread", "process", "memory", "garbage",
+    "exception", "error", "try", "except", "loop", "recursion",
+    "lambda", "closure", "scope", "variable", "module", "package",
+    "import", "virtual", "environment", "pip", "pytest", "unittest",
+    "serializer", "middleware", "authentication", "authorization",
+    "cache", "redis", "celery", "microservice", "monolith",
+    "deployment", "container", "pod", "helm", "terraform",
+    "branch", "merge", "commit", "pull request", "cicd",
+    "agile", "scrum", "sprint", "devops", "cloud",
+    # DevOps/SRE terms
+    "prometheus", "grafana", "monitoring", "metrics", "alerting",
+    "kafka", "zookeeper", "broker", "topic", "partition",
+    "jenkins", "ansible", "terraform", "argo", "argocd",
+    "configmap", "secret", "namespace", "ingress", "service",
+    "kubectl", "eks", "ecs", "ec2", "s3", "iam", "vpc",
+    "cloudwatch", "cloudfront", "load balancer", "autoscaling",
+    "infrastructure", "provisioning", "automation",
+    "nginx", "apache", "reverse proxy", "ssl", "tls",
+    "linux", "bash", "shell", "script", "cron",
+    "openshift", "rancher", "istio", "envoy",
+    # OpenStack services
+    "openstack", "nova", "neutron", "cinder", "glance", "keystone", "swift", "heat", "kolla",
+    "nova-compute", "nova-api", "nova-conductor", "nova-scheduler",
+    "ovs", "openvswitch", "open vswitch", "ovs-vsctl",
+    "kvm", "qemu", "libvirt", "hypervisor", "ceph", "lvm",
+    "migration", "live migration", "cold migration", "evacuate",
+    # Linux/SRE commands and concepts
+    "nf_conntrack", "conntrack", "iptables", "netfilter", "firewall",
+    "lsof", "iostat", "vmstat", "iotop", "htop", "lsblk", "fdisk", "fstab",
+    "fsck", "grub", "selinux", "sestatus", "inode",
+    "load average", "iowait", "cpu utilization",
+    "patching", "yum", "dnf", "apt",
+    "read-only", "mount point", "file system", "remount",
+    "single user mode", "rescue mode", "recovery mode",
+    "open files", "file descriptor",
+    "disk io", "block device", "storage",
+    # Networking
+    "tcp", "udp", "dns", "dhcp", "nat", "vlan", "vxlan",
+    "bridge", "veth", "tap interface",
+    # NFS/SAN/NAS
+    "nfs", "san", "nas", "cifs",
+    "rollout", "rollback", "canary", "blue green",
+    "log", "logging", "tracing", "observability",
+    "annotation", "label", "selector", "replica",
+    "node", "cluster", "scaling", "hpa",
+    "yaml", "json", "xml", "config",
+    "module", "provider", "state", "plan", "apply",
+    "troubleshoot", "debug", "performance", "optimize",
+    "experience", "responsibility", "profile", "tool",
+    "component", "configuration", "command",
+    # Web framework terms
+    "makemigrations", "migrate", "migration", "orm", "jwt", "cors",
+    "drf", "rest framework", "viewset", "serializer",
+    "manage.py", "routing", "signal", "signals",
+    "args", "kwargs", "anagram", "anagrams",
+    "context manager", "metaclass", "abstract",
+    "overriding", "overloading", "oops", "oop",
+    "http method", "http verb", "http status", "put method", "post method", "get method",
+    "patch method", "delete method", "http",
+    "merge conflict", "merge conflicts",
+    "flask", "fastapi", "nginx",
+}
 
-INCOMPLETE_ENDINGS = [
-    "and", "or", "but", "so", "then",
-    "of", "to", "with", "for", "from", "by", "in", "on", "at",
-    "between", "the", "a", "an", "is", "are", "was", "were",
-    "like", "such", "as", "than", "that", "which", "where", "when",
-    "if", "because", "since", "while", "although",
-    "about", "into", "onto", "through", "during",
-    "can", "could", "would", "should", "will", "shall",
-    "do", "does", "did", "have", "has", "had",
-    "be", "being", "been",
-]
-
-# =============================================================================
-# NARRATION PATTERNS - Teaching/explanation, NOT questions
-# =============================================================================
-
-NARRATION_PATTERNS = [
-    # Future tense teaching
-    r"^(we('ll| will)|i('ll| will)|let us)\s+(show|demonstrate|explain|see|look|go|discuss|talk|learn|cover)",
-    r"^(in this|for this)\s+(video|tutorial|lesson|example|problem|section)",
-    r"^(this is|here is|here's)\s+(how|what|the|a|an)",
-    r"^(today|now)\s+(we('ll| will)|i('ll| will)|let's)",
-
-    # Teaching statements
-    r"^(number|string|list|array|variable|object|function|class)s?\s+(swap|sort|reverse|can be|is|are)",
-    r"(can be done|is done|works|is achieved)\s+(like this|this way|as follows|by)",
-    r"^(the (best|right|correct|wrong|proper|common)\s+(way|approach|method|technique))",
-    r"^(one|another)\s+(way|approach|method|technique)\s+(to|is|would be)",
-    r"^(this|it)\s+(allows|provides|enables|helps|helps us)\s+(to|us to)",
-    r"^(the|this)\s+(scientific\s+)?method\s+(is|was|will be|allows)",
-
-    # Instructional
-    # Instructional
-    r"^(first|then|finally|after that)\s*,?\s*(we|you|i|let's)",
-    r"^(let me|i('ll| will)|allow me to)\s+(explain|show|demonstrate|walk)",
-    r"^(as you can see|notice that|observe|watch|look at)",
-    r"^(remember|note|keep in mind|don't forget)",
-
-    # Practice/exercise context
-    r"^(practice|exercise|try|attempt|solve)\s+(this|the|these)",
-    r"^(the (answer|solution|result|output)\s+(is|would be|will be))",
-    r"^(so the|and the)\s+(answer|solution|result|output)",
-    r"^(swap|swapping|sorting|reversing|adding|removing)\s+(is|can|works|happens)",
-
-    # Declarations
-    r"^(python|java|javascript|c\+\+|go|rust|sql|html|css)\s+(has|uses|provides|supports|allows|is|was)",
-    r"^(there are|there is)\s+(many|several|multiple|different|various|two|three|four)",
-    r"^(this|that|it|which)\s+(is|was|will be|would be|represents|defines|means)\s+(a|an|the|our)",
-    r"^(so we can|that's why|this is why|in order to)\s+(do|make|use|call|implement)",
-]
-
-COMPILED_NARRATION = [re.compile(p, re.IGNORECASE) for p in NARRATION_PATTERNS]
-
-# =============================================================================
-# IGNORE PATTERNS - Never trigger on these
-# =============================================================================
+INCOMPLETE_ENDINGS = {
+    "and", "or", "but", "the", "a", "an", "of", "to", "with", "for",
+    "in", "on", "at", "between", "is", "are", "was", "were",
+    "can", "could", "would", "should", "will", "do", "does",
+}
 
 IGNORE_PATTERNS = [
-    # Confirmations/fillers
-    r"^(okay|ok|alright|sure|yes|no|yeah|yep|nope|right|correct|exactly|absolutely)[\s,.!?]*$",
-    r"^(hmm+|umm+|uh+|ah+|oh+|huh)[\s,.!?]*$",
-    r"^(great|good|nice|perfect|excellent|wonderful|awesome)[\s,.!?]*$",
-    r"scientific method", r"natural world", r"empirical evidence", r"observing and gathering",
-
-    # Audio checks
-    r"can you hear me",
-    r"is (this|the audio|my audio|it) working",
-    r"are you (able to|there|ready|hearing)",
-    r"let me (check|know|see)",
-    r"one (moment|second|sec|minute)",
-    r"give me a (moment|second|sec|minute)",
-
-    # Thinking aloud
-    r"^(so+|well|let me (think|see))[\s,.!?]*$",
-    r"^(let's see|let me see|let me think)[\s,.!?]*$",
-
-    # Partial fragments
-    r"^(and|but|so|or|also|then|because|if|when)[\s,.!?]*$",
-    r"^[\s,.!?]*$",
-
-    # Meta comments about interview
-    r"(take your time|no rush|whenever you're ready)",
-    r"(that's|sounds) (good|great|fine|correct|right)",
-    r"^(moving on|next|let's move)",
-
-    # Profanity & Noise
-    r"what the fuck",
-    r"hey what\?$",
-    r"it's too hard to run",
+    # Fillers and acknowledgements
+    r"^(okay|ok|alright|sure|yes|no|yeah|right|hmm|um|uh)[\s,.!?]*$",
+    r"^(great|good|nice|perfect|thanks|thank you)[\s,.!?]*$",
+    # Audio/screen checks
+    r"can you hear me", r"is (this|my audio) working",
+    r"one (moment|second|minute)", r"let me (think|see|check)",
+    r"share.*screen", r"open.*link", r"click on", r"mute",
+    r"Microsoft Office Word.*", r"Word\.Document.*", r"MSWordDoc",
+    r"you're on mute", r"can you see my screen",
+    # Greetings and small talk (not interview questions)
+    r"^(hi|hello|hey|bye|goodbye),?\s*([\w]+)?[.!,]?\s*(good\s*(morning|evening|afternoon|night))?[.!,]?\s*$",
+    r"^good\s*(morning|evening|afternoon|night)[.!,]?\s*$",
+    r"^(hi|hello|hey),?\s*\w+\.\s*(good\s*(morning|evening|afternoon))?",
+    r"^(hi|hello|hey),?\s*\w+\.\s*(bye|goodbye),?\s*\w+",
+    # Camera, physical, and setup instructions
+    r"come\s*(on\s*)?to\s*(the\s*)?camera",
+    r"move\s*towards", r"move\s*to\s*(your|the)\s*(left|right)",
+    r"place\s*(any|a|the)\s*table", r"table\s*or\s*something",
+    r"(face|eye)\s*contact", r"not\s*able\s*to\s*see\s*(the|your)\s*face",
+    r"(above|below|behind)\s*light", r"light\s*is\s*there",
+    r"(your|the)\s*(camera|webcam|video)\s*(is|position|focus|angle)",
+    r"focus\s*slide\s*position", r"slide\s*position",
+    # Physical instructions: light, holding, positioning
+    r"light\s*is\s*coming\s*from\s*(the\s*)?(top|bottom|side|above|behind)",
+    r"(your\s*)?face\s*(is\s*)?(really\s*)?(not\s*)?(visible|clear|showing)\b",
+    r"can\s*you\s*hold\s*(it|the|this)\b",
+    r"(hold|keep)\s*(it|the|this|camera|laptop|phone|light)\s*(up|down|on\s*top|there|still|higher|lower)",
+    r"\blittle\s*(more|higher|lower|up|down)\s*[?,]",
+    r"take\s*(a\s*)?(snapshot|photo|picture|screenshot)\s*(of|now)?",
+    r"keep\s*(the\s*)?(laptop|camera|phone|light|it)\s*(down|up|there|now)\b",
+    r"(adjust|position|fix)\s*(your\s*)?(camera|light|lighting)\b",
+    r"sit\s*(to|towards)\s*(the\s*)?(light|camera|left|right)",
+    # End-of-interview chatter
+    r"(we\s*will\s*)?let\s*you\s*know\b",
+    r"thank\s*you\s*for\s*(your\s*)?time",
+    r"any\s*questions\s*(from|for)\s*(you|your\s*side)",
+    # Recording/compliance setup
+    r"record\s*(the|this)\s*session", r"hope\s*you.*(re|are)\s*comfortable",
+    r"compliance\s*and\s*audit", r"as\s*it\s*is\s*a\s*compliance",
+    # Coordinator/scheduling talk
+    r"waiting\s*for\s*(your|the)\s*confirmation",
+    r"(is\s*it|that)\s*fine\??\s*(can\s*I|shall)", r"can\s*I\s*change\s*the\s*time",
+    r"getting\s*another\s*call", r"stopped\s*recruiting",
+    r"want\s*(to|you)\s*arrange", r"you\s*want\s*(to|any)\s*changes",
+    r"(I|we)\s*(have|are)\s*done\s*from\s*(my|our)\s*side",
+    r"anything\s*else\s*from\s*(your|his|her)\s*side",
+    r"now\s*it'?s?\s*perfect", r"it\s*is\s*like\s*not\s*good",
+    r"last\s*time.*said.*good\s*now",
+    # Non-question interviewer statements (not directed at candidate)
+    r"^(so|okay),?\s*\w+,?\s*we\s*(are|were)",
+    r"^yeah,?\s*(yeah,?\s*)?now",
+    # Meeting platform notifications (Google Meet, Teams, Zoom)
+    r"joined the (meeting|conversation|call)",
+    r"left the (meeting|conversation|call)",
+    r"(meeting|call)\s*(started|ended|recorded)",
+    r"recording\s*(started|stopped|in progress)",
+    r"is presenting",
+    r"named the meeting",
+    r"created this meeting",
+    r"muted their (microphone|mic)",
 ]
 
 COMPILED_IGNORE = [re.compile(p, re.IGNORECASE) for p in IGNORE_PATTERNS]
 
-# =============================================================================
-# FILLER REMOVAL
-# =============================================================================
-
-FILLER_PATTERNS = [
-    r"^(okay|ok|alright|so|well|now|right|yes|yeah)\s*,?\s*",
-    r"^(um+|uh+|hmm+|ah+)\s*,?\s*",
-    r"^(let me ask you|i('ll| will) ask you|my question is|the question is)\s*[,:;]?\s*",
-    r"^(the |this )?(first|next|second|third|last|final|following) question (is|would be)\s*[,:;]?\s*",
-    r"^(can you |could you )?(please |kindly )?(tell me|answer)\s*[,:;]?\s*",
-    r"^(so+|well)\s+",
-    r"^(next slide|it's time|it is time|next time|let's try|let's start|let's see|let's talk about|let's discuss|let's look at)\s*(to|the|if)?\s*,?\s*",
-]
-
-COMPILED_FILLERS = [re.compile(p, re.IGNORECASE) for p in FILLER_PATTERNS]
 
 # =============================================================================
-# PHONETIC CORRECTION MAP (pre-compiled)
+# HALLUCINATION DETECTION
 # =============================================================================
 
-_PHONETIC_RAW = {
-    "translation": "abstraction",
-    "double": "tuple",
-    "in it method": "__init__ method",
-    "death method": "dev method",
-    "incapacitation": "encapsulation",
-    "gap picking": "pickling",
-    "trickling": "pickling",
-    "pick a link": "pickle",
-    "kill and un": "pickling and un",
-}
-_PHONETIC_MAP = {
-    k: (v, re.compile(re.escape(k), re.IGNORECASE))
-    for k, v in _PHONETIC_RAW.items()
-}
-
-# =============================================================================
-# MINIMUM THRESHOLDS
-# =============================================================================
-
-# Minimum question length (relaxed for YouTube)
-MIN_WORD_COUNT = 2      # "Explain polymorphism" is valid
-MIN_CHAR_COUNT = 8      # Very short questions OK if technical
- # Lowered for more flexibility
-
-# =============================================================================
-# CANONICAL INTERVIEW QUESTIONS (ALWAYS ACCEPT - BYPASS WORD COUNT)
-# =============================================================================
-
-TECHNICAL_TERMS = [
-    # Python core
-    "python", "decorator", "generator", "iterator", "closure", "lambda",
-    "class", "function", "method", "module", "package", "member", "concept",
-    "list", "dict", "dictionary", "tuple", "set", "string", "array",
-    "comprehension", "slice", "slicing", "index", "indexing",
-    "args", "kwargs", "argument", "parameter", "default", "keyword",
-    "docstring", "annotation", "type hint", "typing",
-    # Common MCQ terms
-    "identifier", "variable name", "natively", "support", "data type", "output", "length",
-    # OOP
-    "inheritance", "polymorphism", "encapsulation", "abstraction",
-    "object", "instance", "constructor", "destructor", "init",
-    "self", "cls", "static", "classmethod", "staticmethod",
-    "super", "mro", "method resolution", "overriding", "overloading", "override", "overwrite",
-    "composition", "aggregation", "interface", "protocol",
-    # Data structures
-    "stack", "queue", "heap", "tree", "graph", "linked list",
-    "hash", "hashtable", "hashmap", "binary tree", "bst",
-    "deque", "priority queue", "trie", "b-tree", "red-black",
-    "sorting", "searching", "algorithm", "complexity", "big o",
-    # Concepts
-    "recursion", "iteration", "loop", "variable", "constant",
-    "scope", "namespace", "global", "local", "nonlocal",
-    "exception", "error", "try", "except", "finally", "raise",
-    "context manager", "with statement", "yield", "return",
-    "pass by reference", "pass by value", "call by", "assignment",
-    "truthy", "falsy", "boolean", "conditional", "ternary",
-    # Memory
-    "memory", "garbage collection", "gc", "reference", "pointer",
-    "mutable", "immutable", "copy", "deepcopy", "shallow copy",
-    "memory leak", "reference counting", "generational",
-    # Advanced
-    "metaclass", "descriptor", "property", "async", "await",
-    "coroutine", "thread", "threading", "multiprocessing", "gil",
-    "pickle", "pickling", "serialization", "json", "api", "rest",
-    "singleton", "factory", "observer", "strategy", "design pattern",
-    "solid", "dry", "kiss", "dependency injection",
-    # Testing
-    "unittest", "pytest", "testing", "mock", "fixture",
-    "tdd", "bdd", "coverage", "assertion", "test case",
-    # Web
-    "flask", "django", "fastapi", "request", "response", "http",
-    "middleware", "router", "endpoint", "authentication", "authorization",
-    "session", "cookie", "token", "jwt", "oauth",
-    # Database
-    "sql", "database", "orm", "query", "join", "index",
-    "transaction", "acid", "normalization", "denormalization",
-    "nosql", "mongodb", "postgresql", "mysql", "redis",
-    # Python specific
-    "dunder", "magic method", "special method", "__str__", "__repr__",
-    "__eq__", "__hash__", "__len__", "__iter__", "__next__",
-    "__enter__", "__exit__", "__call__", "__getattr__", "__setattr__",
-    "walrus", "f-string", "format", "enumerate", "zip", "map", "filter",
-    "reduce", "any", "all", "sorted", "reversed", "range",
-    # DevOps/Tools
-    "git", "docker", "kubernetes", "ci/cd", "deployment",
-    "virtual environment", "venv", "pip", "poetry", "conda",
-    "asyncio", "concurrent", "future", "executor", "pool",
-    "lock", "semaphore", "mutex", "deadlock", "race condition",
-    # Career & Resume Terms
-    "mediamint", "capgemini", "experience", "responsibility", "project", "role", "background",
-    # Added Topics & Mishearings
-    "abstraction", "translation", "incapacitation", "encapsulation", 
-    "prime", "fizzbuzz", "factorial", "palindrome", "fibonacci",
-    "django", "model", "view", "template", "orm", "migration", "middleware", "serializer", "drf",
-    "sql", "select", "join", "group by", "index", "acid", "transaction", "foreign key",
-    "javascript", "callback", "promise", "async", "await", "closure", "hoisting", "prototype", "dom", "react",
-]
-
-# Canonical question patterns (regex) - ALWAYS ACCEPT if matches
-CANONICAL_PATTERNS = [
-    r"^what (is|are) ",       # "what is python", "what are decorators"
-    r"^explain ",              # "explain generators"
-    r"^define ",               # "define polymorphism"
-    r"^describe ",             # "describe inheritance"
-    r"^tell me about ",        # "tell me about yourself"
-    r"^(hi|hello|hey) ",       # Greetings
-    r"^how are you",           # Social questions
-    r"^your strengths",        # Soft questions
-    r"^your weaknesses",       # Soft questions
-]
-
-import re
-COMPILED_CANONICAL = [re.compile(p, re.IGNORECASE) for p in CANONICAL_PATTERNS]
-
-
-def is_canonical_question(text: str) -> bool:
-    """
-    Check if text is a canonical interview question that should ALWAYS be accepted.
-
-    Canonical questions bypass minimum word count requirements.
-    Examples: "What is Python?", "Explain decorators", "Define polymorphism"
-
-    EXPORTED: Use this for early finalization in audio capture.
-
-    Returns:
-        bool: True if canonical question (accept regardless of length)
-    """
-    if not text:
+def is_hallucination(text: str) -> bool:
+    """Detect Whisper hallucinations (repeated phrases during silence)."""
+    if not text or len(text) < 20:
         return False
 
     lower = text.lower().strip()
+    words = lower.split()
 
-    # If it's a social/social-technical pattern, accept it even without technical terms
-    social_patterns = [
-        r"tell me about ",
-        r"about yourself",
-        r"(hi|hello|hey) ",
-        r"how are you",
-        r"your strengths",
-        r"your weaknesses",
-        r"introduce yourself",
-        r"where are you from",
-        r"where do you (stay|live|locate)",
-    ]
-    
-    for p in social_patterns:
-        if re.search(p, lower):
+    if len(words) > 15:
+        unique = len(set(words))
+        if unique < 5:
+            return True
+        if len(words) / unique > 3:
             return True
 
-    # Check if matches other canonical patterns
-    matches_pattern = False
-    for pattern in COMPILED_CANONICAL:
-        if pattern.match(text):
-            matches_pattern = True
-            break
+    parts = [p.strip() for p in lower.split(',') if p.strip()]
+    if len(parts) >= 3:
+        counts = Counter(parts)
+        if counts.most_common(1)[0][1] >= 3:
+            return True
 
-    if not matches_pattern:
-        return False
-
-    # Check if contains a technical term for other patterns
-    for term in TECHNICAL_TERMS:
-        if term in lower:
+    if len(words) >= 8:
+        bigrams = [f"{words[i]} {words[i+1]}" for i in range(len(words)-1)]
+        bigram_counts = Counter(bigrams)
+        if bigram_counts.most_common(1)[0][1] >= 4:
             return True
 
     return False
 
 
-def _extract_question(text: str) -> str:
-    """
-    Extract question by trimming at first question mark.
-
-    EXTRACTION RULE:
-    - Trim transcription at first ?
-    - Never include trailing explanation from video audio
-
-    Examples:
-        "What is Python? It is a programming language..." -> "What is Python?"
-        "How does GC work? Let me explain..." -> "How does GC work?"
-    """
-    if not text:
-        return ""
-
-    text = text.strip()
-
-    # Find first question mark
-    qmark_idx = text.find('?')
-    if qmark_idx > 0:
-        # Extract up to and including the question mark
-        return text[:qmark_idx + 1].strip()
-
-    return text
-
-
-def _remove_fillers(text: str) -> str:
-    """Remove filler phrases from start of text."""
-    if not text:
-        return ""
-
-    text = text.strip()
-    changed = True
-    iterations = 0
-
-    while changed and iterations < 10:
-        changed = False
-        iterations += 1
-        for pattern in COMPILED_FILLERS:
-            new_text = pattern.sub('', text).strip()
-            if new_text != text and len(new_text) > 0:
-                text = new_text
-                changed = True
-
-    return text
-
-
-def _is_narration(text: str) -> bool:
-    """Check if text is narration/teaching, not a question."""
-    if not text:
-        return False
-
-    for pattern in COMPILED_NARRATION:
-        if pattern.search(text):
-            return True
-
-    return False
-
-
-def _should_ignore(text: str) -> bool:
-    """Check if text should be completely ignored."""
-    if not text:
-        return True
-
-    for pattern in COMPILED_IGNORE:
-        if pattern.search(text):
-            return True
-
-    return False
-
-
-def _has_interview_verb(text: str) -> bool:
-    """Check if text contains at least one interview verb."""
-    if not text:
-        return False
-
-    lower = text.lower()
-
-    for verb in INTERVIEW_VERBS:
-        if verb in lower:
-            return True
-
-    # Check for question mark with reasonable length
-    if text.strip().endswith("?") and len(text.split()) >= MIN_WORD_COUNT:
-        return True
-
-    return False
-
-
-def _is_incomplete(text: str) -> bool:
-    """Check if sentence is incomplete (ends with preposition/conjunction)."""
-    if not text:
-        return True
-
-    stripped = text.strip()
-
-    # If ends with question mark, it's likely complete
-    if stripped.endswith("?"):
-        return False
-
-    # Get last word
-    words = stripped.rstrip("?.,!").split()
-    if not words:
-        return True
-
-    last_word = words[-1].lower()
-
-    # Allow "for" at end if it's part of "used for", "what for", etc.
-    if last_word == "for" and len(words) >= 2:
-        prev_word = words[-2].lower()
-        if prev_word in ["used", "what", "designed", "made", "meant", "needed", "good", "best"]:
-            return False
-
-    return last_word in INCOMPLETE_ENDINGS
-
-
-def _word_count(text: str) -> int:
-    """Count words in text."""
-    if not text:
-        return 0
-    return len(text.split())
-
+# =============================================================================
+# MAIN VALIDATION
+# =============================================================================
 
 def validate_question(text: str) -> Tuple[bool, str, str]:
     """
-    Validate if text is a real interview question.
-
-    Args:
-        text: Raw transcribed text
-
-    Returns:
-        Tuple of (is_valid, cleaned_text, rejection_reason)
-        - is_valid: True if valid interview question
-        - cleaned_text: Cleaned question text (empty if invalid)
-        - rejection_reason: Why rejected (empty if valid)
+    Validate if text is an interview question.
+    Returns: (is_valid, cleaned_text, rejection_reason)
     """
     if not text:
         return False, "", "empty"
 
-    original = text.strip()
+    text = text.strip()
 
-    # Step 0: Extract question (trim at first ?)
-    # This prevents trailing explanations from video audio
-    extracted = _extract_question(original)
-    if extracted != original:
-        original = extracted
+    # Strip common noise prefixes FIRST (before STT corrections, so corrections
+    # can match start-of-string patterns like ^right\s+here)
+    noise_prefixes = [
+        r"^(?:async\s+out\s+there|out\s+there|over\s+there)\.?\s*",
+        r"^(?:yeah|yes|okay|ok|so|and|but|now)\s*,?\s+(?=[A-Z])",
+    ]
+    for prefix_pattern in noise_prefixes:
+        text = re.sub(prefix_pattern, "", text, flags=re.IGNORECASE).strip()
 
-    # Step 1: Check ignore patterns
-    if _should_ignore(original):
-        return False, "", "ignore_pattern"
+    # Apply STT corrections AFTER noise stripping
+    text = apply_stt_corrections(text)
 
-    # Step 2: Remove fillers FIRST (so we can check what's underneath)
-    cleaned = _remove_fillers(original)
+    if is_hallucination(text):
+        return False, "", "hallucination"
 
-    # Step 3: Check narration AFTER filler removal
-    if _is_narration(cleaned):
-        return False, "", "narration"
+    if is_youtube_or_tutorial(text):
+        return False, "", "youtube_tutorial"
 
-    # Step 4: Check again after filler removal
-    if _should_ignore(cleaned):
-        return False, "", "ignore_after_clean"
+    for pattern in COMPILED_IGNORE:
+        if pattern.search(text):
+            return False, "", "ignore_pattern"
 
-    if _is_narration(cleaned):
-        return False, "", "narration_after_clean"
+    words = text.split()
+    if len(words) < 2:
+        return False, "", "too_short"
 
-    # Step 4.5: Phonetic Correction (Hard Mapping)
-    cleaned_lower = cleaned.lower()
-    for mishearing, (correction, pattern) in _PHONETIC_MAP.items():
-        if mishearing in cleaned_lower:
-            cleaned = pattern.sub(correction, cleaned)
-            cleaned_lower = cleaned.lower()
+    # Reject vague pronoun-only questions (e.g., "How do you implement it?")
+    if is_vague_question(text):
+        return False, "", "vague_pronoun_only"
 
-    # Step 5: Check for CANONICAL question (bypass word count)
-    # CRITICAL: "What is Python?" must ALWAYS be accepted
-    is_canonical = is_canonical_question(cleaned)
+    lower = text.lower()
 
-    # Step 6: Check minimum length (SKIP for canonical questions)
-    if not is_canonical:
-        if len(cleaned) < MIN_CHAR_COUNT:
-            return False, "", f"too_short_chars:{len(cleaned)}"
+    last_word = words[-1].rstrip("?.,!").lower()
+    if last_word in INCOMPLETE_ENDINGS and not text.endswith("?"):
+        return False, "", "incomplete"
 
-        word_count = _word_count(cleaned)
-        if word_count < MIN_WORD_COUNT:
-            return False, "", f"too_short_words:{word_count}"
+    has_starter = any(lower.startswith(s) or f" {s}" in lower for s in QUESTION_STARTERS)
+    has_tech = any(t in lower for t in TECH_TERMS)
+    has_question_mark = "?" in text
 
-    # Step 7: Technical Sovereignty & Fragment Check (Bypass strict grammar)
-    tech_count = sum(1 for term in TECHNICAL_TERMS if term in cleaned.lower())
-    word_count = _word_count(cleaned)
-    has_question_mark = cleaned.strip().endswith('?')
+    # Reject very short questions with no tech term (e.g. "What is?", "How?")
+    if len(words) <= 3 and not has_tech and has_question_mark:
+        return False, "", "too_vague"
 
-    # MCQ-style: technical statement ending with period (e.g., "Maximum possible length of an identifier.")
-    # Must have at least 5 words and 1+ technical terms to avoid false positives
-    is_mcq_style = cleaned.endswith('.') and tech_count >= 1 and word_count >= 5
+    # Reject questions with only vague/filler words and no tech term
+    vague_filler = {"what", "about", "the", "other", "one", "that", "this",
+                    "it", "those", "these", "how", "why", "where", "which",
+                    "is", "are", "do", "does", "can", "could", "would", "should",
+                    "a", "an", "of", "for", "and", "or", "some", "any", "just"}
+    content_words = [w.rstrip("?.,!") for w in words if w.rstrip("?.,!").lower() not in vague_filler]
+    if not content_words and not has_tech:
+        return False, "", "too_vague"
 
-    # Step 7a: Check for incomplete sentence EARLY (before accepting tech fragments)
-    is_incomplete = _is_incomplete(cleaned)
+    # HR/behavioral interview questions count as interview-relevant
+    hr_patterns = ["yourself", "your experience", "your background", "your responsibility",
+                   "looking for change", "looking for a change", "why are you leaving",
+                   "still working", "left this organization", "left this company",
+                   "left this job", "left your previous", "left your last",
+                   "have you left",
+                   "notice period", "current ctc", "expected ctc", "salary",
+                   "years of experience", "why do you want", "strengths", "weaknesses",
+                   "tell me about", "walk me through", "your role", "your team",
+                   "current organization", "previous organization", "latest organization",
+                   "go ahead about", "about your"]
+    if any(p in lower for p in hr_patterns):
+        has_tech = True
 
-    # Only accept canonical/MCQ-style if NOT incomplete (unless ends with ?)
-    if is_canonical and not is_incomplete:
-        if len(cleaned) > 1:
-            cleaned = cleaned[0].upper() + cleaned[1:]
-        return True, cleaned, ""
+    is_coding_question = False
+    if re.search(r'\b\w+\s*=\s*\[', text):
+        is_coding_question = True
+    if "find" in lower:
+        is_coding_question = True
+    coding_words = ['sort', 'reverse', 'sum', 'max', 'min', 'count', 'even', 'odd', 'prime', 'duplicate',
+                    'fibonacci', 'palindrome', 'missing', 'largest', 'smallest', 'average',
+                    'slicing', 'slice', 'comprehension', 'factorial', 'swap', 'matrix',
+                    'binary', 'search', 'linked', 'stack', 'queue', 'hash', 'tree']
+    if any(w in lower for w in coding_words):
+        is_coding_question = True
 
-    if is_mcq_style:  # MCQ style already ends with '.', so it's complete
-        if len(cleaned) > 1:
-            cleaned = cleaned[0].upper() + cleaned[1:]
-        return True, cleaned, ""
+    # Interview relevance check: reject casual/setup questions with no tech content
+    # Only include words that are UNAMBIGUOUSLY non-interview (no double meanings)
+    non_interview_words = {'camera', 'webcam', 'table', 'arrange', 'comfortable',
+                           'recording', 'audible', 'visible', 'mute', 'unmute',
+                           'confirmation', 'slide position', 'focus slide',
+                           'sit', 'stand'}
+    non_interview_phrases = [
+        'come on to the camera', 'move towards', 'place any table',
+        'eye contact', 'above light', 'is it fine', 'want to arrange',
+        'from my side', 'from your side', 'anything else from',
+        'now it\'s perfect', 'not good properly', 'can I change the time',
+    ]
+    has_non_interview = (any(w in lower for w in non_interview_words) or
+                         any(p in lower for p in non_interview_phrases)) and not has_tech
 
-    if has_question_mark and tech_count >= 1:
-        if len(cleaned) > 1:
-            cleaned = cleaned[0].upper() + cleaned[1:]
-        return True, cleaned, ""
+    if has_starter and has_tech:
+        pass
+    elif has_question_mark and len(words) >= 3 and not has_non_interview:
+        pass
+    elif has_starter and len(words) >= 2 and not has_non_interview:
+        pass
+    elif has_tech and len(words) >= 6:
+        pass
+    elif is_coding_question:
+        pass
+    else:
+        return False, "", "no_question_pattern"
 
-    # Step 8: Standard Interview Verb Check
-    if not _has_interview_verb(cleaned):
-        return False, cleaned, "no_interview_verb"
+    cleaned = text[0].upper() + text[1:] if len(text) > 1 else text
 
-    # Step 9: Check for incomplete sentence
-    if is_incomplete:
-        if tech_count < 2:
-            return False, cleaned, "incomplete_sentence"
-
-    # Step 10: RELAXED REQUIREMENT - Accept interrogative or MCQ-style questions
-    first_words = cleaned.lower().split()[:3]
-    first_two = ' '.join(first_words[:2]) if len(first_words) >= 2 else ''
-    first_three = ' '.join(first_words[:3]) if len(first_words) >= 3 else ''
-
-    has_interrogative_start = any([
-        first_words[0] in ['what', 'why', 'how', 'explain', 'define', 'describe', 'compare', 'tell', 'which', 'is', 'are', 'can', 'hi', 'hello', 'hey', 'introduce', 'write', 'implement', 'create', 'function', 'maximum', 'minimum', 'default', 'output', 'result', 'value', 'type', 'true', 'false', 'correct', 'incorrect', 'name'],
-        first_two in ['what is', 'what are', 'how do', 'how does', 'why is', 'why do', 'is it', 'are there', 'do you', 'can you', 'tell me', 'write a', 'implement a', 'function to', 'how to', 'which of', 'which one', 'output of', 'result of', 'value of', 'type of', 'true about', 'false about', 'name the', 'name a'],
-        first_three in ['tell me about', 'can you explain', 'how are you', 'write a function', 'logic to find', 'which of the', 'which one of', 'what is the', 'what are the'],
-        '?' in cleaned,
-        # MCQ-style: statements ending with period that contain technical terms (already validated above)
-        cleaned.endswith('.') and tech_count >= 1 and _word_count(cleaned) >= 4
-    ])
-
-    if not has_interrogative_start:
-        return False, cleaned, "no_interrogative_start"
-
-    # Step 9: Format output
-    # Capitalize first letter
-    if len(cleaned) > 1:
-        cleaned = cleaned[0].upper() + cleaned[1:]
-
-    # Ensure proper ending
-    if not cleaned.endswith(("?", ".", "!")):
-        # Add question mark for question-style text
-        lower = cleaned.lower()
-        if any(lower.startswith(q) for q in ["what", "how", "why", "when", "where", "which", "can", "could", "is", "are", "do", "does"]):
-            cleaned += "?"
+    if has_starter and not cleaned.endswith(("?", ".", "!")):
+        cleaned += "?"
 
     return True, cleaned, ""
 
 
-def is_valid_interview_question(text: str) -> bool:
-    """
-    Simple check: is this a valid interview question?
+def clean_and_validate(text: str) -> Tuple[bool, str, str]:
+    """Alias for validate_question."""
+    return validate_question(text)
 
-    Use validate_question() for detailed rejection reason.
-    """
+
+def is_valid_interview_question(text: str) -> bool:
+    """Simple boolean check."""
     is_valid, _, _ = validate_question(text)
     return is_valid
 
 
-def clean_and_validate(text: str):
-    """
-    Clean and validate question. Returns (is_valid, cleaned_text, reason).
-    """
-    return validate_question(text)
-
-
 # =============================================================================
-# CODE REQUEST DETECTION
+# QUESTION SPLITTING
 # =============================================================================
 
-CODE_REQUEST_PATTERNS = [
-    "write code", "write a code", "write the code",
-    "write a function", "write function", "write the function",
-    "write a program", "write program",
-    "write a script", "write script",
-    "implement", "implementation",
-    "show me the code", "show code", "show the code",
-    "code example", "code for",
-    "program to", "function to", "script to",
-    "give me code", "give code",
-]
+def split_merged_questions(text: str) -> str:
+    """Extract the best question from merged audio."""
+    if not text:
+        return text
+
+    text = text.strip()
+    lower = text.lower()
+
+    positions = []
+    for starter in QUESTION_STARTERS:
+        idx = 0
+        while True:
+            pos = lower.find(starter, idx)
+            if pos == -1:
+                break
+            if pos == 0 or text[pos-1] in ' ,.':
+                positions.append((pos, starter))
+            idx = pos + 1
+
+    if len(positions) < 2:
+        return text
+
+    positions.sort()
+
+    for pos, starter in reversed(positions):
+        candidate = text[pos:].strip()
+        if len(candidate.split()) >= 4:
+            return candidate
+
+    return text
+
+
+_is_whisper_hallucination = is_hallucination
 
 
 def is_code_request(text: str) -> bool:
-    """Check if question explicitly requests code."""
+    """Check if question explicitly asks for code/script output.
+
+    Must be conservative - only trigger for clear "write code" requests,
+    not for questions that mention code-related words in passing.
+    """
     if not text:
         return False
+    lower = text.lower().strip()
 
-    lower = text.lower()
+    # If the user explicitly asks for an explanation, it's NOT a code request
+    explanation_triggers = [
+        "explain", "describe", "concept", "theory", "what is the difference",
+        "difference between", "what is", "what are", "what does", "how does",
+        "how do", "how to deploy", "how to set up", "how to configure",
+        "how to monitor", "how to troubleshoot", "how to scale",
+        "how to manage", "how to handle", "how to secure",
+        "why", "when would", "tell me", "what will", "what if",
+        "do we need", "can you", "is it", "those are", "status code",
+        "time complexity", "send", "chat box", "chat book",
+        "all the available", "available playbooks", "list the",
+    ]
+    if any(lower.startswith(t) for t in explanation_triggers):
+        return False
+    # Also reject if it's a conversational/follow-up question
+    if any(p in lower for p in ["send this", "send me", "in the chat", "chat box", "chat book",
+                                  "time complexity", "those are", "status code",
+                                  "do we need", "is it the", "what will be"]):
+        return False
 
-    for pattern in CODE_REQUEST_PATTERNS:
-        if pattern in lower:
-            return True
+    # Only trigger for explicit "write code/program/function" requests
+    explicit_code_phrases = [
+        "write code", "write a code", "write the code for",
+        "write a function", "write a program", "write a script",
+        "write a method", "write a class", "write a generator",
+        "write script", "write a query", "code for decorator",
+        "code for palindrome", "code for fibonacci",
+        "simple code for", "write simple code",
+        "define a class", "define a function", "define a method",
+        "define a generator", "define class", "define function",
+        "create a class", "create a function", "create a method",
+        "implement a function", "implement a class", "implement a method",
+        "use a list comprehension", "use list comprehension",
+        "yaml script", "ansible playbook", "terraform script",
+        "groovy script", "jenkinsfile", "dockerfile", "docker-compose",
+        "sql query",
+    ]
+    if any(p in lower for p in explicit_code_phrases):
+        return True
+
+    # "Write ... code/function/method" pattern (e.g. "Write me a decorator code")
+    if re.search(r'\bwrite\b.*\b(code|function|program|script|query|method|class)\b', lower):
+        return True
+
+    # "Define ... class/function/method" pattern
+    if re.search(r'\bdefine\b.*\b(class|function|method|generator)\b', lower):
+        return True
+
+    # NEW: Implicit code requests - questions that clearly expect code output
+    # Pattern: "find/get/return/calculate/reverse/sort/check ... [data structure/algorithm term]"
+    implicit_code_verbs = [
+        "find", "get", "return", "calculate", "compute", "reverse",
+        "sort", "check", "validate", "convert", "transform", "merge",
+        "filter", "remove", "delete", "insert", "add", "count",
+        "sum", "multiply", "divide", "swap", "rotate", "flatten",
+        "group", "split", "join", "search", "detect", "extract"
+    ]
+    
+    # Algorithm/data structure terms that indicate coding
+    coding_context_terms = [
+        "anagram", "palindrome", "fibonacci", "factorial", "prime",
+        "even", "odd", "duplicate", "unique", "missing", "largest",
+        "smallest", "maximum", "minimum", "average", "median",
+        "list", "array", "string", "dict", "dictionary", "set",
+        "tree", "linked list", "stack", "queue", "heap", "graph",
+        "matrix", "binary", "hash", "sorted", "unsorted",
+        "ascending", "descending", "recursive", "iterative"
+    ]
+    
+    # Check if question has implicit code pattern: verb + coding term
+    has_code_verb = any(f"{verb} " in lower or lower.startswith(verb) for verb in implicit_code_verbs)
+    has_coding_term = any(term in lower for term in coding_context_terms)
+    
+    if has_code_verb and has_coding_term:
+        return True
+    
+    # Pattern: "by passing [data structure]" - common in coding questions
+    if re.search(r'\bby passing\b.*(list|array|string|dict)', lower):
+        return True
+    
+    # Pattern: variable assignment in question (e.g., "str = ['eat', 'cat']")
+    if re.search(r'\b\w+\s*=\s*[\[\{"\']', lower):
+        return True
 
     return False
 
 
-# =============================================================================
-# TEST SUITE
-# =============================================================================
 
 if __name__ == "__main__":
-    test_cases = [
-        # === MUST REJECT ===
-        # Greetings/confirmations
-        ("Okay", False, "ignore_pattern"),
-        ("Alright", False, "ignore_pattern"),
-        ("Can you hear me?", False, "ignore_pattern"),
-        ("Let me think", False, "ignore_pattern"),
-        ("Hmm", False, "ignore_pattern"),
-        ("Great", False, "ignore_pattern"),
-
-        # Narration/teaching (CRITICAL)
-        ("We'll show you how to swap numbers in Python", False, "narration"),
-        ("Number swap can be done like this", False, "narration"),
-        ("Let me explain this first", False, "narration"),
-        ("In this problem we will see how to reverse a list", False, "narration"),
-        ("Don't do this method it's wrong", False, "narration"),
-        ("Swapping is done using tuple unpacking", False, "narration"),
-        ("Python has a simple way to swap variables", False, "narration"),
-        ("The best way to do this is using enumerate", False, "narration"),
-        ("First we will define the function", False, "narration"),
-        ("As you can see the output is correct", False, "narration"),
-        ("There are many ways to solve this", False, "narration"),
-        ("The answer is using a dictionary", False, "narration"),
-
-        # Incomplete sentences (CRITICAL)
-        ("What is the difference between", False, "incomplete_sentence"),
-        ("Explain the concept of", False, "incomplete_sentence"),
-        ("How do you handle errors in", False, "incomplete_sentence"),
-        ("What happens when you use", False, "incomplete_sentence"),
-        ("Can you explain the", False, "incomplete_sentence"),
-
-        # CANONICAL QUESTIONS - MUST ACCEPT (even if short)
-        ("What is Python", True, ""),  # Canonical - ACCEPT
-        ("What is decorator", True, ""),  # Canonical - ACCEPT
-        ("Explain decorators", True, ""),  # Canonical - ACCEPT
-        ("What are generators", True, ""),  # Canonical - ACCEPT
-
-        # Still too short (not canonical)
-        ("Tell me about it", False, "too_short"),  # Not canonical, too short
-
-        # No interview verb
-        ("Python is a great language right", False, "no_interview_verb"),
-        ("I use Python every day at work", False, "no_interview_verb"),
-
-        # === MUST ACCEPT ===
-        # Direct questions
-        ("What is Python and why is it popular?", True, ""),
-        ("How do you swap two numbers in Python?", True, ""),
-        ("Explain how decorators work in Python", True, ""),
-        ("What is the difference between list and tuple?", True, ""),
-        ("Why is Python called an interpreted language?", True, ""),
-
-        # Coding requests
-        ("Write code to swap two numbers", True, ""),
-        ("Implement a function to reverse a string", True, ""),
-        ("Write a program to find duplicates in a list", True, ""),
-
-        # With fillers (should clean and accept)
-        ("Okay, what is Python used for?", True, ""),
-        ("Alright, explain list comprehensions in Python", True, ""),
-        ("The first question is what is pickling?", True, ""),
-
-        # Edge cases that should pass
-        ("Can you explain what happens when Python imports a module?", True, ""),
-        ("How would you handle exceptions in a production system?", True, ""),
-        ("What's the difference between append and extend methods?", True, ""),
+    tests = [
+        ("What is a class in Python?", True),
+        ("Explain decorators", True),
+        ("Difference between list and tuple", True),
+        ("How does garbage collection work?", True),
+        ("Tell me about yourself", True),
+        ("What is, What is, What is, What is", False),
+        ("Okay", False),
+        ("Can you hear me?", False),
+        ("the", False),
+        ("What is the", False),
+        # YouTube detection
+        ("In this video we will learn about Python decorators", False),
+        ("Subscribe to my channel for more tutorials", False),
+        ("Let's get started with today's tutorial", False),
+        ("Hey guys welcome to my Python course", False),
+        ("Don't forget to like and subscribe", False),
+        # Vague pronoun-only questions
+        ("How do you implement it?", False),
+        ("Can you explain that?", False),
+        ("What does it do?", False),
+        # STT correction: "A, C, D" -> "CI/CD"
+        ("What is a, c, d?", True),
+        ("What is A C D and how do you implement it in your project?", True),
     ]
 
-    print("=" * 70)
-    print("STRICT INTERVIEW QUESTION VALIDATOR - TEST SUITE")
-    print("=" * 70)
-    print()
+    print("=" * 50)
+    print("QUESTION VALIDATOR TEST")
+    print("=" * 50)
 
     passed = 0
-    failed = 0
-
-    for text, expected_valid, expected_reason in test_cases:
+    for text, expected in tests:
         is_valid, cleaned, reason = validate_question(text)
-
-        # Check validity
-        validity_match = is_valid == expected_valid
-
-        # For rejections, check if reason category matches
-        reason_match = True
-        if not expected_valid and expected_reason:
-            reason_match = reason.startswith(expected_reason.split(":")[0])
-
-        success = validity_match and reason_match
-
-        if success:
+        status = "PASS" if is_valid == expected else "FAIL"
+        if is_valid == expected:
             passed += 1
-            status = "PASS"
-        else:
-            failed += 1
-            status = "FAIL"
+        print(f"{status} '{text[:50]}' -> valid={is_valid} (expected={expected})")
+        if reason:
+            print(f"   Reason: {reason}")
 
-        print(f"[{status}] Input: \"{text}\"")
-        print(f"       Expected: valid={expected_valid}, reason~{expected_reason}")
-        print(f"       Got:      valid={is_valid}, reason={reason}")
-        if is_valid:
-            print(f"       Cleaned:  \"{cleaned}\"")
-        print()
-
-    print("=" * 70)
-    print(f"RESULTS: {passed} passed, {failed} failed out of {len(test_cases)}")
-    print("=" * 70)
+    print(f"\n{passed}/{len(tests)} tests passed")

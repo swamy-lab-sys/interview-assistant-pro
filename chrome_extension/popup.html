@@ -110,8 +110,9 @@
     <div id="qrOverlay" class="qr-overlay">
         <h3>Stealth Mode</h3>
         <p>Scan to view answers on phone.<br>Desktop screen stays clean.</p>
-        <img src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=http://172.20.10.10:8000" alt="Scan Me">
-        <br><br>
+        <img id="qrImage" src="" alt="Scan Me">
+        <p id="qrUrl" style="font-size: 10px; color: #999; margin-top: 5px;">Loading...</p>
+        <br>
         <button id="btnBack" class="btn btn-mobile">Back to Desktop</button>
     </div>
 

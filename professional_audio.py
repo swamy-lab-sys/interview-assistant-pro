@@ -1,13 +1,14 @@
 """
 Professional Audio Capture Engine - CONCURRENT EDITION
-Using sounddevice for maximum compatibility with PipeWire/PulseAudio.
+Supports: sounddevice > pyaudio > parec (PulseAudio direct)
 Maintains a persistent stream for zero-latency capture.
 """
 
 import numpy as np
-import sounddevice as sd
+import subprocess
 import queue
 import time
+import threading
 from collections import deque
 import os
 
@@ -15,6 +16,44 @@ import os
 SAMPLE_RATE = 16000
 CHANNELS = 1
 CHUNK_SIZE = 480  # 30ms
+BYTES_PER_CHUNK = CHUNK_SIZE * 4  # float32 = 4 bytes per sample
+
+# Detect best available backend
+_BACKEND = None
+sd = None
+pyaudio_module = None
+
+try:
+    import sounddevice as _sd
+    _sd.query_devices()
+    sd = _sd
+    _BACKEND = "sounddevice"
+except Exception:
+    pass
+
+if not _BACKEND:
+    try:
+        import pyaudio as _pa
+        # Quick test: can PyAudio initialize?
+        _test_pa = _pa.PyAudio()
+        _test_pa.get_default_input_device_info()
+        _test_pa.terminate()
+        pyaudio_module = _pa
+        _BACKEND = "pyaudio"
+    except Exception:
+        pass
+
+if not _BACKEND:
+    # Use parec (PulseAudio/PipeWire direct - bypasses ALSA)
+    import shutil
+    if shutil.which("parec"):
+        _BACKEND = "parec"
+
+if _BACKEND:
+    print(f"  [Audio] Backend: {_BACKEND}")
+else:
+    print("[CRITICAL] No audio backend available!")
+
 
 class SharedAudioStream:
     """
@@ -22,95 +61,186 @@ class SharedAudioStream:
     Prevents latency/glitches from constant start/stop.
     """
     _instance = None
-    
+
     def __new__(cls):
         if cls._instance is None:
             cls._instance = super(SharedAudioStream, cls).__new__(cls)
             cls._instance.is_active = False
             cls._instance.audio_queue = queue.Queue(maxsize=10000)
             cls._instance.stream = None
-            # Rely on PortAudio/PulseAudio default (respects PULSE_SOURCE)
-            cls._instance.device = None 
+            cls._instance.pa_instance = None
+            cls._instance._parec_proc = None
+            cls._instance._parec_thread = None
+            cls._instance.device = None
         return cls._instance
 
-    def _callback(self, indata, frames, time_info, status):
-        """Streaming callback."""
+    # === sounddevice backend ===
+    def _sd_callback(self, indata, frames, time_info, status):
         if self.is_active:
             try:
                 self.audio_queue.put_nowait(indata.copy().flatten())
             except queue.Full:
                 pass
 
+    # === pyaudio backend ===
+    def _pa_callback(self, in_data, frame_count, time_info, status):
+        if self.is_active:
+            try:
+                audio = np.frombuffer(in_data, dtype=np.float32)
+                self.audio_queue.put_nowait(audio.copy())
+            except queue.Full:
+                pass
+        return (None, 0)
+
+    # === parec backend ===
+    def _parec_reader(self):
+        """Read raw audio from parec subprocess stdout."""
+        proc = self._parec_proc
+        while self.is_active and proc and proc.poll() is None:
+            try:
+                data = proc.stdout.read(BYTES_PER_CHUNK)
+                if not data:
+                    break
+                audio = np.frombuffer(data, dtype=np.float32)
+                if len(audio) == CHUNK_SIZE:
+                    self.audio_queue.put_nowait(audio.copy())
+            except queue.Full:
+                pass
+            except Exception:
+                break
+
     def start(self):
-        if self.stream is not None:
+        if self.stream is not None or self._parec_proc is not None:
             return
-        
-        try:
-            self.is_active = True
-            self.stream = sd.InputStream(
-                samplerate=SAMPLE_RATE,
-                channels=CHANNELS,
-                device=self.device, # None = System Default
-                callback=self._callback,
-                blocksize=CHUNK_SIZE
-            )
-            self.stream.start()
-        except Exception as e:
-            print(f"[CRITICAL] Could not start audio stream: {e}")
-            self.stream = None
+
+        self.is_active = True
+
+        if _BACKEND == "sounddevice":
+            try:
+                self.stream = sd.InputStream(
+                    samplerate=SAMPLE_RATE,
+                    channels=CHANNELS,
+                    device=self.device,
+                    callback=self._sd_callback,
+                    blocksize=CHUNK_SIZE
+                )
+                self.stream.start()
+            except Exception as e:
+                print(f"[CRITICAL] sounddevice failed: {e}")
+                self.stream = None
+
+        elif _BACKEND == "pyaudio":
+            try:
+                self.pa_instance = pyaudio_module.PyAudio()
+                self.stream = self.pa_instance.open(
+                    format=pyaudio_module.paFloat32,
+                    channels=CHANNELS,
+                    rate=SAMPLE_RATE,
+                    input=True,
+                    frames_per_buffer=CHUNK_SIZE,
+                    stream_callback=self._pa_callback
+                )
+                self.stream.start_stream()
+            except Exception as e:
+                print(f"[CRITICAL] pyaudio failed: {e}")
+                self.stream = None
+
+        elif _BACKEND == "parec":
+            try:
+                # Build parec command - captures from system monitor source
+                source = os.environ.get("PULSE_SOURCE", "")
+                cmd = [
+                    "parec",
+                    f"--rate={SAMPLE_RATE}",
+                    f"--channels={CHANNELS}",
+                    "--format=float32le",
+                    "--latency-msec=30",
+                ]
+                if source:
+                    cmd.append(f"--device={source}")
+
+                self._parec_proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    bufsize=BYTES_PER_CHUNK
+                )
+                self._parec_thread = threading.Thread(
+                    target=self._parec_reader, daemon=True
+                )
+                self._parec_thread.start()
+            except Exception as e:
+                print(f"[CRITICAL] parec failed: {e}")
+                self._parec_proc = None
 
     def stop(self):
         self.is_active = False
-        if self.stream:
+        if _BACKEND == "sounddevice" and self.stream:
             self.stream.stop()
             self.stream.close()
             self.stream = None
+        elif _BACKEND == "pyaudio" and self.stream:
+            self.stream.stop_stream()
+            self.stream.close()
+            self.stream = None
+            if self.pa_instance:
+                self.pa_instance.terminate()
+                self.pa_instance = None
+        elif _BACKEND == "parec" and self._parec_proc:
+            self._parec_proc.terminate()
+            self._parec_proc.wait(timeout=2)
+            self._parec_proc = None
 
     def get_chunk(self, timeout=0.1):
         try:
             return self.audio_queue.get(timeout=timeout)
         except queue.Empty:
             return None
-            
+
     def flush(self):
         """Clear all pending audio."""
         while not self.audio_queue.empty():
-            try: self.audio_queue.get_nowait()
-            except: break
+            try:
+                self.audio_queue.get_nowait()
+            except:
+                break
+
 
 # Global stream instance
 _stream = SharedAudioStream()
 
+
 class SmartVAD:
-    """
-    Ultra-sensitive adaptive Speech Detection.
-    """
+    """Ultra-sensitive adaptive Speech Detection."""
     def __init__(self):
         self.noise_floor = 0.0001
         self.speech_threshold = 0.0005
         self.history = deque(maxlen=100)
-        
+
     def update(self, chunk):
         rms = np.sqrt(np.mean(chunk**2))
         self.history.append(rms)
         if len(self.history) >= 10:
             self.noise_floor = max(np.percentile(list(self.history), 10), 0.0001)
             self.speech_threshold = max(self.noise_floor * 2.5, 0.001)
-            
+
     def is_speech(self, chunk):
-        chunk_boosted = chunk * 100.0
+        chunk_boosted = chunk * 20.0
         rms = np.sqrt(np.mean(chunk_boosted**2))
         self.update(chunk_boosted)
         return rms > 0.02
 
+
 def capture_question(max_duration=6.0, silence_duration=1.2, verbose=False):
-    """
-    Capture a single question segment. 
-    Uses the persistent global stream.
-    """
+    """Capture a single question segment using the persistent global stream."""
+    if _BACKEND is None:
+        if verbose:
+            print("[ERROR] No audio backend available")
+        return None
+
     _stream.start()
-    _stream.flush() # Start fresh for this segment
-    
+    _stream.flush()
+
     vad = SmartVAD()
     audio_chunks = []
     lead_buffer = deque(maxlen=int(500 / 30))
@@ -118,17 +248,19 @@ def capture_question(max_duration=6.0, silence_duration=1.2, verbose=False):
     silence_chunks = 0
     max_silence_chunks = int(silence_duration * 1000 / 30)
     max_chunks = int(max_duration * 1000 / 30)
-    
+
     start_time = time.time()
-    
+
     try:
-        while (time.time() - start_time) < (max_duration + 2.0): # Safety timeout
+        while (time.time() - start_time) < (max_duration + 2.0):
             chunk = _stream.get_chunk(timeout=0.1)
-            if chunk is None: continue
-            
+            if chunk is None:
+                continue
+
             if vad.is_speech(chunk):
                 if not speech_detected:
-                    if verbose: print("\n[SPEECH] Detected!")
+                    if verbose:
+                        print("\n[SPEECH] Detected!")
                     audio_chunks.extend(list(lead_buffer))
                     lead_buffer.clear()
                     speech_detected = True
@@ -139,33 +271,37 @@ def capture_question(max_duration=6.0, silence_duration=1.2, verbose=False):
                     silence_chunks += 1
                     audio_chunks.append(chunk)
                     if silence_chunks > max_silence_chunks:
-                        if verbose: print(f"[SILENCE] {silence_duration}s detected.")
+                        if verbose:
+                            print(f"[SILENCE] {silence_duration}s detected.")
                         break
                 else:
                     lead_buffer.append(chunk)
-            
+
             if len(audio_chunks) >= max_chunks:
                 break
-                
+
         if not audio_chunks:
             return None
-            
+
         full_audio = np.concatenate(audio_chunks)
-        
-        # Optimize for Whisper
-        rms = np.sqrt(np.mean(full_audio**2))
-        if rms > 0.00001:
-            gain = 0.1 / rms
-            full_audio = full_audio * gain
-            
+
+        # Normalize for Whisper
+        max_val = np.abs(full_audio).max()
+        if max_val > 0.001:
+            full_audio = full_audio / max_val * 0.9
+
         return full_audio
-        
+
     except Exception as e:
-        if verbose: print(f"[ERROR] capture_question: {e}")
+        if verbose:
+            print(f"[ERROR] capture_question: {e}")
         return None
 
+
 if __name__ == "__main__":
-    print("Testing capture...")
+    print(f"Testing capture (backend: {_BACKEND})...")
     q = capture_question(verbose=True)
     if q is not None:
-        print(f"Captured {len(q)} samples.")
+        print(f"Captured {len(q)} samples ({len(q)/SAMPLE_RATE:.1f}s)")
+    else:
+        print("No audio captured.")

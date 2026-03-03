@@ -49,6 +49,10 @@ _dir_ensured = False
 _last_write_time: float = 0.0
 _WRITE_THROTTLE_INTERVAL = 0.15  # Write to disk at most every 150ms during streaming
 
+# Read cache for get_all_answers() - avoids redundant disk reads from SSE poller
+_read_cache: Optional[List[Dict[str, Any]]] = None
+_read_cache_mtime: float = 0.0
+
 
 def ensure_answers_dir():
     """Create answers directory if not exists (cached after first call)."""
@@ -65,7 +69,7 @@ def _write_current(force: bool = False):
         force: If True, always write immediately (used for complete answers).
                If False, throttle writes to reduce disk I/O during streaming.
     """
-    global _last_write_time
+    global _last_write_time, _all_answers, _answer_index, _read_cache
 
     now = time.monotonic()
     if not force and (now - _last_write_time) < _WRITE_THROTTLE_INTERVAL:
@@ -73,6 +77,30 @@ def _write_current(force: bool = False):
 
     try:
         ensure_answers_dir()
+
+        # Cross-process disk sync: only on forced writes (complete answers)
+        # During streaming (force=False), skip the expensive disk read since
+        # the writer process owns the authoritative state.
+        if force and CURRENT_ANSWER_FILE.exists():
+            try:
+                with open(CURRENT_ANSWER_FILE, 'r', encoding='utf-8') as f:
+                    content = f.read().strip()
+                    if content:
+                        disk_data = json.loads(content)
+                        if isinstance(disk_data, list):
+                            # Find answers on disk that we don't have in memory
+                            memory_questions = {a.get('question', '').strip().lower() for a in _all_answers if a.get('question')}
+                            for disk_ans in disk_data:
+                                if isinstance(disk_ans, dict) and disk_ans.get('question'):
+                                    q_lower = disk_ans['question'].strip().lower()
+                                    if q_lower not in memory_questions:
+                                        # Add disk answer to memory
+                                        _answer_index[q_lower] = len(_all_answers)
+                                        _all_answers.append(disk_ans)
+                                        memory_questions.add(q_lower)
+            except Exception:
+                pass  # If read fails, proceed with memory state
+
         # Build full list: completed answers + current in-progress answer
         display_list = list(_all_answers)
         # If current answer is being streamed (not yet in _all_answers), add it
@@ -84,6 +112,7 @@ def _write_current(force: bool = False):
             if force:
                 os.fsync(f.fileno())
         _last_write_time = now
+        _read_cache = None  # Invalidate read cache after write
     except Exception:
         pass
 
@@ -112,8 +141,13 @@ def _log_permanent(data: Dict[str, Any]):
         pass
 
 
-def clear_all():
-    """Clear all stored answers (fresh start)."""
+def clear_all(force_clear: bool = False):
+    """Clear all stored answers.
+    
+    Args:
+        force_clear: If True, delete disk files (fresh start).
+                    If False, only clear memory (allows recovery on restart).
+    """
     global _current_answer, _all_answers, _answer_index, _dir_ensured
 
     _dir_ensured = False
@@ -130,18 +164,20 @@ def clear_all():
         _all_answers = []
         _answer_index = {}
 
-        try:
-            with open(CURRENT_ANSWER_FILE, 'w', encoding='utf-8') as f:
-                json.dump([], f, ensure_ascii=False)
+        # Only delete files if explicitly requested (manual clear)
+        if force_clear:
+            try:
+                with open(CURRENT_ANSWER_FILE, 'w', encoding='utf-8') as f:
+                    json.dump([], f, ensure_ascii=False)
 
-            # Clear history file (Session only)
-            if HISTORY_FILE.exists():
-                HISTORY_FILE.unlink()
+                # Clear history file (Session only)
+                if HISTORY_FILE.exists():
+                    HISTORY_FILE.unlink()
 
-            # NOTE: We DO NOT clear MASTER_LOG_FILE
+                # NOTE: We DO NOT clear MASTER_LOG_FILE
 
-        except Exception:
-            pass
+            except Exception:
+                pass
 
 
 def set_processing_question(question_text: str):
@@ -190,17 +226,43 @@ def set_complete_answer(
     Set complete answer with optional metrics.
 
     ATOMIC OPERATION:
+    - Syncs from disk first (handles multi-process scenarios)
     - Finalizes the current answer
     - Adds it to the accumulated session list
     - Stores performance metrics
     - Single UI update
     - Logs to permanent storage
     """
-    global _current_answer, _all_answers
+    global _current_answer, _all_answers, _answer_index
 
     ensure_answers_dir()
 
     with _write_lock:
+        # CRITICAL: Sync from disk first to avoid overwriting other process's data
+        # This handles the case where main.py writes Q&A and server.py adds coding solutions
+        if CURRENT_ANSWER_FILE.exists():
+            try:
+                with open(CURRENT_ANSWER_FILE, 'r', encoding='utf-8') as f:
+                    content = f.read().strip()
+                    if content:
+                        disk_data = json.loads(content)
+                        if isinstance(disk_data, list):
+                            # Merge disk data with memory (disk is source of truth)
+                            disk_questions = {a.get('question', '').strip().lower() for a in disk_data if a.get('question')}
+                            memory_questions = {a.get('question', '').strip().lower() for a in _all_answers}
+                            
+                            # If disk has answers we don't have in memory, use disk as base
+                            if disk_questions - memory_questions:
+                                _all_answers = [a for a in disk_data if isinstance(a, dict) and a.get('question')]
+                                # Rebuild index
+                                _answer_index = {}
+                                for i, ans in enumerate(_all_answers):
+                                    q_lower = ans.get('question', '').strip().lower()
+                                    if q_lower:
+                                        _answer_index[q_lower] = i
+            except Exception:
+                pass  # If read fails, proceed with memory state
+
         _current_answer = {
             'question': question_text.strip(),
             'answer': answer_text.strip(),
@@ -246,31 +308,61 @@ def get_all_answers() -> list:
     Get ALL session answers (newest first).
     No deduplication, no limit -- every Q&A is preserved for interview reference.
 
-    Reads from memory if available (main process), otherwise reads from
-    the JSON file on disk (web server subprocess).
+    Uses mtime-guarded cache to avoid redundant disk reads from SSE poller.
+    The main process writes to disk, the web server (separate process) reads from disk.
     """
-    with _write_lock:
-        display_list = list(_all_answers)
-        # Include current in-progress answer at the top
-        if _current_answer.get('question') and not _current_answer.get('is_complete'):
-            display_list.append(_current_answer.copy())
+    global _read_cache, _read_cache_mtime
 
-    # If in-memory list is empty, read from disk (web server runs in separate process)
-    if not display_list and CURRENT_ANSWER_FILE.exists():
-        try:
+    display_list = []
+
+    # Check disk file with mtime guard to avoid redundant reads
+    try:
+        if CURRENT_ANSWER_FILE.exists():
+            mtime = CURRENT_ANSWER_FILE.stat().st_mtime
+            if _read_cache is not None and mtime == _read_cache_mtime:
+                # File hasn't changed, return cached result
+                return list(_read_cache)
+
+            # File changed, re-read
             with open(CURRENT_ANSWER_FILE, 'r', encoding='utf-8') as f:
                 data = json.load(f)
                 if isinstance(data, list):
                     display_list = [a for a in data if a.get('question')]
                 elif isinstance(data, dict) and data.get('question'):
-                    # Backward compat: old single-answer format
                     display_list = [data]
-        except Exception:
-            pass
+
+            # Newest first for display
+            display_list.reverse()
+            # Cache the result
+            _read_cache = list(display_list)
+            _read_cache_mtime = mtime
+            return display_list
+    except Exception:
+        pass
+
+    # Fallback to in-memory if disk file missing (main process only)
+    if not display_list:
+        with _write_lock:
+            display_list = list(_all_answers)
+            if _current_answer.get('question') and not _current_answer.get('is_complete'):
+                display_list.append(_current_answer.copy())
 
     # Newest first for display
     display_list.reverse()
     return display_list
+
+
+def is_already_answered(question_text: str) -> Optional[Dict[str, Any]]:
+    """O(1) check if a question has already been answered.
+
+    Returns the existing answer dict if found, None otherwise.
+    """
+    q_lower = question_text.strip().lower()
+    with _write_lock:
+        idx = _answer_index.get(q_lower)
+        if idx is not None and idx < len(_all_answers):
+            return _all_answers[idx].copy()
+    return None
 
 
 def get_latest_answer() -> Optional[Dict[str, Any]]:
@@ -318,3 +410,51 @@ def finalize_answer():
 def clear_answers():
     """Alias for clear_all."""
     clear_all()
+
+
+def load_history_on_startup():
+    """Load existing answers from disk into memory on startup.
+    
+    Filters out incomplete answers (from crashes) and handles corrupted files.
+    """
+    global _all_answers, _answer_index
+    
+    # Ensure directory exists
+    ensure_answers_dir()
+
+    if CURRENT_ANSWER_FILE.exists():
+        try:
+            with open(CURRENT_ANSWER_FILE, 'r', encoding='utf-8') as f:
+                content = f.read().strip()
+                if not content:
+                    return
+
+                data = json.loads(content)
+                if isinstance(data, list):
+                    with _write_lock:
+                        # Filter for COMPLETE answers only (exclude partial answers from crashes)
+                        _all_answers = [
+                            a for a in data 
+                            if isinstance(a, dict) 
+                            and a.get('question')
+                            and a.get('is_complete', True)  # Only complete answers
+                        ]
+                        
+                        # Rebuild index
+                        _answer_index = {}
+                        for i, ans in enumerate(_all_answers):
+                            q_lower = ans.get('question', '').strip().lower()
+                            if q_lower:
+                                _answer_index[q_lower] = i
+                        
+                        if _all_answers:
+                            print(f"[STORAGE] ✓ Restored {len(_all_answers)} Q&A from previous session")
+        except json.JSONDecodeError as e:
+            print(f"[STORAGE] ⚠️ Corrupted history file, starting fresh: {e}")
+            # Clear corrupted file
+            clear_all(force_clear=True)
+        except Exception as e:
+            print(f"[STORAGE] ⚠️ Failed to load history: {e}")
+
+# NOTE: Do not auto-load at import. main.py calls clear_all() immediately after import.
+# Web server.py should call load_history_on_startup() explicitly if needed.

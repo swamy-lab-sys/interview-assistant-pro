@@ -215,10 +215,11 @@ Environment Variables:
         print("Type questions and press Enter. Type 'quit' to exit.\n")
 
         # Load resume if exists
-        resume_file = Path("resume.txt")
+        from config import RESUME_PATH
+        resume_file = Path(RESUME_PATH)
         if resume_file.exists():
             client.set_resume(resume_file.read_text())
-            print("✓ Loaded resume.txt\n")
+            print(f"✓ Loaded {resume_file}\n")
 
         while True:
             try:

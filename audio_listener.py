@@ -15,10 +15,10 @@ import numpy as np
 import webrtcvad
 import time
 import os
+import re
 import scipy.signal
 import subprocess
 import signal
-import noisereduce as nr
 import sys
 import warnings
 from collections import deque
@@ -36,7 +36,7 @@ CHUNK_SIZE = int(SAMPLE_RATE * CHUNK_DURATION_MS / 1000)
 SELECTED_AUDIO_DEVICE = None
 
 # Volume gate: YouTube optimized
-MIN_VOLUME_THRESHOLD = 0.005
+MIN_VOLUME_THRESHOLD = 0.01
 DETECTION_THRESHOLD = 0.02
 
 # Adaptive silence durations (seconds)
@@ -85,6 +85,7 @@ def is_system_audio_device(device_name):
     system_keywords = [
         'monitor', 'loopback', 'stereo mix', 'wave out', 'what u hear',
         'output', 'system_audio', 'sink', 'playback', 'speaker', 'pipewire',
+        'microphone', 'mic', 'input'  # Enforcing microphone acceptance for testing
     ]
 
     for keyword in system_keywords:
@@ -117,7 +118,6 @@ def list_audio_devices():
                 
                 # Format: "ID: type description=\"Full Name\" prio=X"
                 # Example: "52: monitor description=\"Speaker + Headphones\" prio=1000"
-                import re
                 match = re.search(r'^\*?\s*(\d+):\s+(\w+)\s+description="([^"]+)"', line)
                 if match:
                     idx = match.group(1)
@@ -166,8 +166,8 @@ def select_audio_device_interactive():
             # ONLY ACCEPT MONITOR/LOOPBACK
             if 'monitor' in name.lower() or 'loopback' in name.lower():
                 # Explicitly REJECT anything that looks like a microphone input
-                if 'mic' in name.lower() or 'input' in name.lower() and 'monitor' not in name.lower():
-                    continue
+                # if 'mic' in name.lower() or 'input' in name.lower() and 'monitor' not in name.lower():
+                #     continue
                 monitors.append(name)
 
         # 1. ALWAYS PREFER THE DEFAULT SINK MONITOR
@@ -177,6 +177,12 @@ def select_audio_device_interactive():
             for mon in monitors:
                 if mon == default_monitor:
                     SELECTED_AUDIO_DEVICE = mon
+                    # Ensure unmuted and volume is up (done once at selection, not per-capture)
+                    try:
+                        subprocess.run(['pactl', 'set-source-mute', mon, '0'], stderr=subprocess.DEVNULL)
+                        subprocess.run(['pactl', 'set-source-volume', mon, '100%'], stderr=subprocess.DEVNULL)
+                    except Exception:
+                        pass
                     print(f"✓ Using Default Sink: {SELECTED_AUDIO_DEVICE}")
                     return mon
         except Exception:
@@ -274,10 +280,7 @@ def record_until_silence(
     if sys.platform.startswith('linux') and device and ('monitor' in device.lower() or 'loopback' in device.lower()):
         process = None
         try:
-            # Ensure unmuted
-            subprocess.run(['pactl', 'set-source-mute', str(device), '0'], stderr=subprocess.DEVNULL)
-            subprocess.run(['pactl', 'set-source-volume', str(device), '100%'], stderr=subprocess.DEVNULL)
-            
+            # Volume/mute already set in select_audio_device_interactive()
             cmd = f"parec -d {device} --format=s16le --rate=16000 --channels=1"
             process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, shell=True)
             
@@ -295,14 +298,13 @@ def record_until_silence(
                 # Convert s16le to float32 normalized [-1, 1]
                 chunk_int = np.frombuffer(raw_bytes, dtype=np.int16)
                 chunk = chunk_int.astype(np.float32) / 32768.0
-                
+
                 raw_rms = np.sqrt(np.mean(chunk**2))
-                
-                # YOUTUBE OPTIMIZED GAIN (80x)
-                chunk = chunk * 80.0 
-                
-                rms = np.sqrt(np.mean(chunk**2))
-                
+
+                # Amplify in-place and derive amplified RMS from raw (avoids recompute)
+                chunk *= 15.0
+                rms = raw_rms * 15.0
+
                 # Volume bar (Calibrated for weak monitor audio)
                 bar_len = int(min(rms * 100, 30))
                 bar = "#" * bar_len
@@ -341,25 +343,10 @@ def record_until_silence(
 
             if audio_chunks:
                 full_audio = np.concatenate(audio_chunks)
-                
-                # 1. AGGRESSIVE NOISE REDUCTION for YouTube
-                try:
-                    if len(full_audio) > 8000:
-                        # Pre-emphasis to boost speech frequencies
-                        full_audio = np.append(full_audio[0], full_audio[1:] - 0.97 * full_audio[:-1])
-                        # Aggressive noise reduction
-                        full_audio = nr.reduce_noise(
-                            y=full_audio, 
-                            sr=16000, 
-                            prop_decrease=0.9,  # Remove 90% of noise
-                            stationary=True
-                        )
-                except Exception as e:
-                    if os.environ.get('VERBOSE'): print(f"\n[DEBUG] Noise reduction failed: {e}")
 
-                # 2. PEAK NORMALIZATION: Ensure AI hears it at perfect volume
+                # Peak normalization for Whisper
                 max_val = np.abs(full_audio).max()
-                if max_val > 0.1: 
+                if max_val > 0.01:
                     full_audio = full_audio / max_val * 0.9
                 return full_audio
             return np.array([], dtype=np.float32)
@@ -435,12 +422,6 @@ def record_until_silence(
                 stream.close()
             except:
                 pass
-
-    # print()  # New line after capture
-
-    if audio_chunks:
-        return np.concatenate(audio_chunks)
-    return np.array([], dtype=np.float32)
 
 
 def record_until_silence_parec(

@@ -1,0 +1,44 @@
+{
+    "manifest_version": 3,
+    "name": "Interview Voice Assistant",
+    "version": "2.0",
+    "description": "Push-to-talk voice assistant for real-time interviews with global shortcuts",
+    "permissions": [
+        "storage",
+        "system.display"
+    ],
+    "host_permissions": [
+        "http://localhost:8000/*",
+        "https://meet.google.com/*",
+        "https://zoom.us/*",
+        "https://*.teams.microsoft.com/*"
+    ],
+    "background": {
+        "service_worker": "background.js"
+    },
+    "action": {
+        "default_title": "Interview Voice Assistant",
+        "default_popup": "popup.html"
+    },
+    "commands": {
+        "open-voice-mode": {
+            "suggested_key": {
+                "default": "Ctrl+Shift+V",
+                "mac": "Command+Shift+V"
+            },
+            "description": "Open voice assistant in new tab"
+        },
+        "open-voice-popup": {
+            "suggested_key": {
+                "default": "Ctrl+Shift+A",
+                "mac": "Command+Shift+A"
+            },
+            "description": "Open voice assistant in small window"
+        }
+    },
+    "icons": {
+        "16": "icon16.png",
+        "48": "icon48.png",
+        "128": "icon128.png"
+    }
+}

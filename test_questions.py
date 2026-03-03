@@ -12,14 +12,15 @@ if not os.environ.get("ANTHROPIC_API_KEY"):
     sys.exit(1)
 
 import answer_storage
+import config
 from llm_client import stream_coding_answer, stream_with_resume
+from resume_loader import load_resume as load_resume_file
 from intent_detector import is_coding_question
 
 def load_resume():
     """Load resume from file"""
     try:
-        with open("resume.txt", "r") as f:
-            return f.read()
+        return load_resume_file(config.RESUME_PATH)
     except:
         return "4+ years Python developer experience"
 

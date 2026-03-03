@@ -109,10 +109,10 @@ _in_cooldown = False
 _cooldown_end_time = 0.0
 _cooldown_lock = threading.Lock()
 
-# Cooldown duration (seconds) - adaptive range
-COOLDOWN_MIN = 1.5  # Minimum cooldown
-COOLDOWN_DEFAULT = 3.0  # Default cooldown
-COOLDOWN_MAX = 5.0  # Maximum cooldown for complex answers
+# Cooldown duration (seconds) - reduced for real-time interview responsiveness
+COOLDOWN_MIN = 0.5  # Short answers - be ready fast
+COOLDOWN_DEFAULT = 1.5  # Normal answers
+COOLDOWN_MAX = 3.0  # Complex/code answers
 
 # Last question tracking (for deduplication within session)
 _last_question = ""
@@ -290,8 +290,15 @@ def should_block_input() -> bool:
 
     CRITICAL: This must be the FIRST check after audio capture.
     If True, discard input silently (no logging, no validation).
+
+    Optimized: fast-path check of _generating flag first (no lock needed
+    for a simple bool read on CPython due to GIL), then check cooldown
+    only if not generating.
     """
-    return is_generating() or is_in_cooldown()
+    # Fast path: if generating, no need to check cooldown
+    if _generating:
+        return True
+    return is_in_cooldown()
 
 
 def should_ignore_audio() -> bool:

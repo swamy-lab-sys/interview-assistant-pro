@@ -35,19 +35,20 @@ from llm_client import (
     get_interview_answer,
     get_coding_answer,
     get_streaming_interview_answer,
+    clear_session,
+    humanize_response,
 )
-from resume_loader import load_resume
+from resume_loader import load_resume, load_job_description
 import audio_listener
 from audio_listener import (
     record_until_silence,
     select_audio_device_interactive,
-    flush_audio_buffers,
 )
 from stt import transcribe, load_model as load_stt_model
-from speaker_detector import is_interviewer
 import output_manager
 import answer_storage
-from question_validator import clean_and_validate, is_code_request
+import fragment_context
+from question_validator import clean_and_validate, is_code_request, split_merged_questions, _is_whisper_hallucination
 import performance_logger
 import threading
 import queue
@@ -73,6 +74,7 @@ VAD_AGGRESSIVENESS = config.VAD_AGGRESSIVENESS
 # =============================================================================
 
 resume = ""
+job_description = ""
 should_exit = False
 
 
@@ -91,21 +93,50 @@ signal.signal(signal.SIGINT, signal_handler)
 # RESUME LOADING
 # =============================================================================
 
+_last_resume_check = 0
+_UPLOADED_RESUME_PATH = os.path.expanduser("~/.interview_assistant/uploaded_resume.txt")
+
 def load_resume_context():
-    """Load resume with error handling."""
-    global resume
-    try:
-        resume = load_resume("resume.txt")
-        # if len(resume.strip()) < 50:
-        #     print("Note: resume.txt is short or empty")
-        # else:
-        #     print(f"Resume loaded ({len(resume)} chars)")
+    """Load resume ONLY if uploaded via UI. Never load built-in resume.txt."""
+    global resume, _last_resume_check
+    now = time.time()
+    if resume and now - _last_resume_check < _CONTEXT_CHECK_INTERVAL:
         return True
-    except FileNotFoundError:
-        # print("Note: resume.txt not found (answers will be generic)")
+    _last_resume_check = now
+    try:
+        if os.path.exists(_UPLOADED_RESUME_PATH):
+            resume = load_resume(_UPLOADED_RESUME_PATH)
+            return bool(resume.strip())
+        resume = ""
         return False
     except Exception:
+        resume = ""
         return False
+
+
+_jd_mtime = 0
+_last_context_check = 0
+_CONTEXT_CHECK_INTERVAL = 30.0  # Only check file changes every 30s
+
+def load_jd_context():
+    """Load job description from file (cached, checks mtime at most every 30s)."""
+    global job_description, _jd_mtime, _last_context_check
+    now = time.time()
+    if now - _last_context_check < _CONTEXT_CHECK_INTERVAL:
+        return bool(job_description)
+    _last_context_check = now
+    try:
+        jd_path = config.JD_PATH
+        if os.path.exists(jd_path):
+            mtime = os.path.getmtime(jd_path)
+            if mtime != _jd_mtime:
+                with open(jd_path, 'r') as f:
+                    job_description = f.read()
+                _jd_mtime = mtime
+            return True
+    except Exception:
+        pass
+    return False
 
 
 # =============================================================================
@@ -127,9 +158,12 @@ def handle_question(question_text: str) -> bool:
     Returns:
         bool: True if answered
     """
-    # Start request logging
     dlog.start_request()
     dlog.log(f"Processing question: {question_text}", "INFO")
+
+    # Dynamic context reload
+    load_jd_context()
+    load_resume_context()
 
     # Step 1: FIRST GATE - check before any work
     if state.should_block_input():
@@ -158,7 +192,6 @@ def handle_question(question_text: str) -> bool:
 
             ui_start = time.time()
             state.mark_ui_start()
-            answer_storage.set_complete_answer(question_text, cached_answer, None)
             output_manager.write_header(question_text)
             output_manager.write_answer_chunk(cached_answer)
             output_manager.write_footer()
@@ -174,7 +207,6 @@ def handle_question(question_text: str) -> bool:
         finally:
             # ALWAYS release lock
             state.stop_generation()
-            flush_audio_buffers()
             state.start_cooldown(answer_length=len(answer), is_code='```' in answer)
             state.set_last_question(question_text)
 
@@ -204,41 +236,24 @@ def handle_question(question_text: str) -> bool:
         dlog.log_llm_start(question_text)
 
         if wants_code:
-            # Coding questions still single-shot for stability of code blocks
+            # Coding questions: single-shot for clean code blocks
             dlog.log("Using single-shot mode for code", "DEBUG")
             answer = get_coding_answer(question_text)
+            llm_time = (time.time() - llm_start) * 1000
+            print(f"[PERF] LLM Generation (Code): {llm_time:.0f}ms")
+
             answer_storage.set_complete_answer(question_text, answer, None)
             output_manager.write_answer_chunk(answer)
             dlog.log_llm_complete(time.time() - llm_start, len(answer), False)
         else:
-            # STREAMING for normal questions
-            dlog.log("Using streaming mode", "DEBUG")
+            # Interview answers: single-shot so humanize runs BEFORE UI display
+            dlog.log("Using single-shot mode for interview", "DEBUG")
             state.mark_ui_start()
-            full_answer = []
-            chunk_count = 0
-
-            # Start stream
-            for chunk in get_streaming_interview_answer(question_text, resume):
-                if chunk:
-                    chunk_count += 1
-                    full_answer.append(chunk)
-                    answer_storage.append_answer_chunk(chunk)
-                    output_manager.write_answer_chunk(chunk)
-                    if chunk_count % 10 == 0:  # Log every 10 chunks
-                        dlog.log_llm_chunk(chunk_count, len(chunk))
-
-            # Fallback if streaming failed (e.g. library mismatch)
-            if not full_answer:
-                dlog.log_warn("Streaming failed, falling back to single-shot")
-                answer = get_interview_answer(question_text, resume, include_code=False)
-                output_manager.write_answer_chunk(answer)
-                answer_storage.set_complete_answer(question_text, answer, None)
-                dlog.log_llm_complete(time.time() - llm_start, len(answer), False)
-            else:
-                answer = "".join(full_answer)
-                dlog.log_llm_complete(time.time() - llm_start, len(answer), True)
-                dlog.log(f"Received {chunk_count} chunks", "DEBUG")
-                print()  # Newline after stream
+            answer = get_interview_answer(question_text, resume, job_description, include_code=False)
+            llm_time = (time.time() - llm_start) * 1000
+            print(f"[PERF] LLM Generation: {llm_time:.0f}ms")
+            output_manager.write_answer_chunk(answer)
+            dlog.log_llm_complete(time.time() - llm_start, len(answer), False)
 
         state.mark_llm_end()
 
@@ -275,7 +290,6 @@ def handle_question(question_text: str) -> bool:
         # ALWAYS release lock and start cooldown
         state.stop_generation()
         dlog.log_state_change("GENERATING", "COOLDOWN")
-        flush_audio_buffers()
         state.start_cooldown(answer_length=len(answer), is_code=wants_code or '```' in answer)
         state.set_last_question(question_text)
 
@@ -299,7 +313,7 @@ def capture_worker():
             capture_start = time.time()
             audio = capture_question(
                 max_duration=config.MAX_RECORDING_DURATION,
-                silence_duration=0.5,  # Faster - reduced from 0.8s
+                silence_duration=config.SILENCE_DEFAULT,  # Used config for better pause handling
                 verbose=False
             )
             capture_time = time.time() - capture_start
@@ -347,18 +361,29 @@ def processing_worker():
             stt_time = time.time() - stt_start
 
             if not transcription or len(transcription) < 5:
+                # Log even short transcriptions for debugging
+                if config.VERBOSE:
+                     print(f"[PERF] Transcribe: {stt_time*1000:.0f}ms | Confidence: {score:.2f} | Text: '{transcription}'")
                 dlog.log(f"Transcription too short: '{transcription}'", "DEBUG")
                 audio_queue.task_done()
                 continue
 
-            dlog.log_transcription(stt_time, transcription, score)
-
+            # Log significant performance metrics
+            print(f"\n[PERF] Transcribe: {stt_time*1000:.0f}ms | Confidence: {score:.2f}")
             if config.VERBOSE:
-                print(f"\n[DEBUG] Captured: '{transcription}' (conf: {score:.2f})")
+                 print(f"[TEXT] '{transcription}'")
 
             # 2. Confidence Filter
             if score < 0.25:
                 dlog.log(f"Low confidence ({score:.2f}), skipping", "DEBUG")
+                audio_queue.task_done()
+                continue
+
+            # 2b. EARLY HALLUCINATION CHECK - Reject Whisper hallucinations immediately
+            if _is_whisper_hallucination(transcription):
+                if config.VERBOSE:
+                    print(f"[HALLUCINATION] Rejected: '{transcription[:50]}...'")
+                dlog.log(f"Hallucination rejected: '{transcription[:50]}'", "DEBUG")
                 audio_queue.task_done()
                 continue
 
@@ -388,7 +413,7 @@ def processing_worker():
 
             # 2b. WAIT: Check if more audio is coming (but shorter wait for complete sentences)
             wait_start = time.time()
-            AGGREGATION_WINDOW = 0.3 if is_complete_sentence else 0.6  # Reduced from 1.2s
+            AGGREGATION_WINDOW = 0.05 if is_complete_sentence else 0.15  # EXTREME SPEED
 
             more_chunks_arrived = False
             while (time.time() - wait_start) < AGGREGATION_WINDOW:
@@ -416,6 +441,22 @@ def processing_worker():
             # Reset buffer
             processing_worker.text_buffer = []
 
+            # SPLIT MERGED QUESTIONS: Extract the best question if multiple are merged
+            original_text = full_text
+            full_text = split_merged_questions(full_text)
+            if full_text != original_text:
+                if config.VERBOSE:
+                    print(f"[SMART] Extracted question: '{full_text}'")
+                dlog.log(f"Split merged: '{original_text}' -> '{full_text}'", "DEBUG")
+
+            # FRAGMENT MERGING: Merge with recent chat/voice context
+            merged_text, was_merged = fragment_context.merge_with_context(full_text)
+            if was_merged:
+                dlog.log(f"Fragment merged: '{full_text}' -> '{merged_text}'", "INFO")
+                if config.VERBOSE:
+                    print(f"[MERGE] '{full_text}' + context -> '{merged_text}'")
+                full_text = merged_text
+
             # Validate the COMBINED text
             validate_start = time.time()
             is_valid, cleaned, reason = clean_and_validate(full_text)
@@ -437,7 +478,7 @@ def processing_worker():
             # one at a time to keep the UI clean.
             gate_start = time.time()
             while state.should_block_input() and not should_exit:
-                time.sleep(0.5)
+                time.sleep(0.05)  # Reduced from 0.5s for faster unlocking
             gate_wait = time.time() - gate_start
 
             if gate_wait > 0.1:
@@ -451,6 +492,9 @@ def processing_worker():
             dlog.log(f"Passing to handle_question: '{validated}'", "INFO")
             answer_storage.set_processing_question(validated)
             handle_question(validated)
+
+            # 6. Save context for cross-source fragment merging
+            fragment_context.save_context(validated, "voice")
 
             audio_queue.task_done()
 
@@ -492,12 +536,19 @@ def start(boot_start_time: float = None):
     print("\n" + "=" * 60)
     print("INTERVIEW VOICE ASSISTANT")
     print("=" * 60)
+    print(f"  STT Model: {config.STT_MODEL}")
+    print(f"  LLM Model: {os.environ.get('LLM_MODEL_OVERRIDE', config.LLM_MODEL)}")
 
-    # Clear stale state and logs
+    # Clear runtime state (locks, cooldowns, etc.)
     state.force_clear_all()
     answer_cache.clear_cache()
-    answer_storage.clear_all()
+    fragment_context.clear_context()
     dlog.clear_logs()
+
+    # Clear all previous Q&A data for fresh interview
+    # (run.sh already deletes files, this ensures in-memory is also clear)
+    answer_storage.clear_all(force_clear=True)
+    print("✓ Fresh interview session started")
 
     # Log startup (to file only)
     dlog.log("=" * 60, "INFO")
@@ -509,8 +560,6 @@ def start(boot_start_time: float = None):
         subprocess.run(["fuser", "-k", "8000/tcp"], capture_output=True, timeout=2)
         subprocess.Popen(
             [sys.executable, "web/server.py"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
             start_new_session=True
         )
         print("✓ Web UI: http://localhost:8000")
@@ -543,7 +592,22 @@ def main():
         print("[ERROR] ANTHROPIC_API_KEY not set.")
         sys.exit(1)
 
+    # Resume only loaded if uploaded via UI (not built-in resume.txt)
     load_resume_context()
+    if resume:
+        print(f"✓ Resume loaded ({len(resume)} chars)")
+    else:
+        print("  No resume uploaded (upload via UI if needed)")
+
+    # Load job description
+    global job_description
+    try:
+        job_description = load_job_description(config.JD_PATH)
+        if job_description.strip():
+            print(f"✓ Job Description loaded ({len(job_description)} chars)")
+    except:
+        pass
+    
     start()
 
 
